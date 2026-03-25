@@ -12,13 +12,16 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 use shared::{
-    pagination::Cursor, AnalyticsEventType, AuditActionType, ChangePublisherRequest, Contract,
-    ContractAnalyticsResponse, ContractAuditLog, ContractChangelogEntry, ContractChangelogResponse,
-    ContractGetResponse, ContractInteractionResponse, ContractSearchParams, ContractVersion,
+    pagination::Cursor, AnalyticsEventType, AuditActionType, CategoryCount,
+    ChangePublisherRequest, Contract, ContractAnalyticsResponse, ContractAuditLog,
+    ContractChangelogEntry, ContractChangelogResponse, ContractGetResponse,
+    ContractInteractionResponse, ContractSearchParams, ContractVersion,
     CreateContractVersionRequest, CreateInteractionBatchRequest, CreateInteractionRequest,
-    DeploymentStats, InteractionTimeSeriesPoint, InteractionTimeSeriesResponse,
-    InteractionsListResponse, InteractionsQueryParams, InteractorStats, Network, NetworkConfig,
-    PaginatedResponse, PublishRequest, Publisher, SemVer, TimelineEntry, TopUser, TrendingParams,
+    DashboardAnalyticsResponse, DeploymentStats, DeploymentTrend,
+    GraphResponse, InteractionTimeSeriesPoint, InteractionTimeSeriesResponse,
+    InteractionsListResponse, InteractionsQueryParams, InteractorStats,
+    Network, NetworkConfig, NetworkCount, PaginatedResponse, PublishRequest,
+    Publisher, SemVer, TimelineEntry, TopUser, TrendingParams,
     UpdateContractMetadataRequest, UpdateContractStatusRequest, VerifyRequest,
 };
 use std::time::Duration;
@@ -34,7 +37,7 @@ use crate::{
     analytics,
     breaking_changes::{diff_abi, has_breaking_changes, resolve_abi},
     dependency,
-    error::{ApiError, ApiResult},
+    error::{ApiError, ApiResult, AppError},
     state::AppState,
     type_safety::parser::parse_json_spec,
     type_safety::{generate_openapi, to_json, to_yaml},
@@ -60,7 +63,7 @@ fn map_query_rejection(err: QueryRejection) -> ApiError {
     )
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::Type)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "contract_audit_event_type", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ContractAuditEventType {
@@ -71,7 +74,7 @@ pub enum ContractAuditEventType {
     PublisherChanged,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 #[allow(dead_code)]
 pub struct ContractAuditLogEntry {
     pub id: Uuid,
@@ -3041,6 +3044,98 @@ pub async fn route_not_found() -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({"error": "Route not found"})),
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ANALYTICS DASHBOARD (issue #430)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[utoipa::path(
+    get,
+    path = "/api/analytics/dashboard",
+    params(TrendingParams),
+    responses(
+        (status = 200, description = "Aggregated dashboard analytics", body = DashboardAnalyticsResponse)
+    ),
+    tag = "Analytics"
+)]
+pub async fn get_dashboard_analytics(
+    State(state): State<AppState>,
+    Query(params): Query<TrendingParams>,
+) -> ApiResult<Json<DashboardAnalyticsResponse>> {
+    let timeframe = params.timeframe.unwrap_or_else(|| "7d".to_string());
+    let trailing_days = match timeframe.as_str() {
+        "7d" => 7,
+        "30d" => 30,
+        "90d" => 90,
+        _ => return Err(ApiError::bad_request("InvalidTimeframe", "timeframe must be one of: 7d, 30d, 90d")),
+    };
+
+    let category_distribution: Vec<CategoryCount> = sqlx::query_as(
+        r#"
+        SELECT COALESCE(category, 'Uncategorized') as category, COUNT(*)::bigint as count
+        FROM contracts
+        GROUP BY COALESCE(category, 'Uncategorized')
+        ORDER BY count DESC
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch category distribution", err))?;
+
+    let network_usage: Vec<NetworkCount> = sqlx::query_as(
+        r#"
+        SELECT network, COUNT(*)::bigint as count
+        FROM contracts
+        GROUP BY network
+        ORDER BY count DESC
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch network usage", err))?;
+
+    let deployment_trends: Vec<DeploymentTrend> = sqlx::query_as(
+        r#"
+        WITH dates AS (
+            SELECT generate_series(
+                CURRENT_DATE - make_interval(days => $1),
+                CURRENT_DATE,
+                '1 day'::interval
+            )::date as date
+        )
+        SELECT 
+            to_char(d.date, 'YYYY-MM-DD') as date, 
+            COUNT(c.id)::bigint as count
+        FROM dates d
+        LEFT JOIN contracts c ON c.created_at::date = d.date
+        GROUP BY d.date
+        ORDER BY d.date ASC
+        "#
+    )
+    .bind(trailing_days)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch deployment trends", err))?;
+
+    let recent_additions: Vec<Contract> = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM contracts
+        ORDER BY created_at DESC
+        LIMIT 5
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch recent additions", err))?;
+
+    Ok(Json(DashboardAnalyticsResponse {
+        category_distribution,
+        network_usage,
+        deployment_trends,
+        recent_additions,
+    }))
 }
 
 #[cfg(test)]
