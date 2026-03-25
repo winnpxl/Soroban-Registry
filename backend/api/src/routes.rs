@@ -3,8 +3,8 @@ use crate::openapi;
 use crate::{
     ab_test_handlers, auth, auth_handlers, batch_verify_handlers, breaking_changes,
     canary_handlers, compatibility_testing_handlers, custom_metrics_handlers, deprecation_handlers,
-    handlers, metrics_handler, migration_handlers, performance_handlers, resource_handlers,
-    simulation_handlers, state::AppState,
+    contract_events, handlers, metrics_handler, migration_handlers, performance_handlers,
+    resource_handlers, simulation_handlers, state::AppState,
 };
 use axum::{
     middleware,
@@ -28,6 +28,7 @@ pub fn auth_routes() -> Router<AppState> {
 
 pub fn contract_routes() -> Router<AppState> {
     Router::new()
+        .route("/ws/contracts", get(contract_events::contracts_websocket))
         .route(
             "/api/contracts",
             get(handlers::list_contracts).post(handlers::publish_contract),

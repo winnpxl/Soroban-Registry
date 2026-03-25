@@ -1,5 +1,6 @@
 use crate::auth::AuthManager;
 use crate::cache::{CacheConfig, CacheLayer};
+use crate::contract_events::ContractEventHub;
 use crate::health_monitor::HealthMonitorStatus;
 use crate::resource_tracking::ResourceManager;
 use prometheus::Registry;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub health_monitor_status: HealthMonitorStatus,
     pub auth_mgr: Arc<RwLock<AuthManager>>,
     pub resource_mgr: Arc<RwLock<ResourceManager>>,
+    pub contract_events: Arc<ContractEventHub>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
             AuthManager::from_env().expect("JWT config validated at startup"),
         ));
         let resource_mgr = Arc::new(RwLock::new(ResourceManager::new()));
+        let contract_events = Arc::new(ContractEventHub::from_env());
         Self {
             db,
             started_at: Instant::now(),
@@ -44,6 +47,7 @@ impl AppState {
             health_monitor_status: HealthMonitorStatus::default(),
             auth_mgr,
             resource_mgr,
+            contract_events,
         }
     }
 }
