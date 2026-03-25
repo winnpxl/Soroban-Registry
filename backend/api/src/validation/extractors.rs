@@ -102,7 +102,8 @@ pub trait Validatable: Sized {
 /// 1. Parse JSON from the request body
 /// 2. Sanitize all string fields (trim, strip HTML, normalize)
 /// 3. Validate fields against defined rules
-/// 4. Return detailed 400 errors for validation failures
+/// 4. Log validation failures for security monitoring
+/// 5. Return detailed 400 errors for validation failures
 ///
 /// # Example
 ///
@@ -127,34 +128,79 @@ where
     type Rejection = ValidationError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // Extract client IP and correlation ID for logging
+        let client_ip = req
+            .extensions()
+            .get::<std::net::SocketAddr>()
+            .map(|addr| addr.ip())
+            .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+
+        let correlation_id = req
+            .headers()
+            .get("x-correlation-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let path = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|p| p.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         // Step 1: Parse JSON
-        let Json(mut data) = Json::<T>::from_request(req, state)
-            .await
-            .map_err(|err| {
-                // Convert JSON parsing errors to validation errors
-                let message = match err {
-                    axum::extract::rejection::JsonRejection::JsonDataError(e) => {
-                        format!("Invalid JSON data: {}", e.body_text())
-                    }
-                    axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
-                        format!("JSON syntax error: {}", e.body_text())
-                    }
-                    axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
-                        "Content-Type must be application/json".to_string()
-                    }
-                    axum::extract::rejection::JsonRejection::BytesRejection(_) => {
-                        "Failed to read request body".to_string()
-                    }
-                    _ => "Invalid JSON payload".to_string(),
-                };
-                ValidationError::single("body", message)
-            })?;
+        let Json(mut data) = Json::<T>::from_request(req, state).await.map_err(|err| {
+            // Convert JSON parsing errors to validation errors
+            let message = match err {
+                axum::extract::rejection::JsonRejection::JsonDataError(e) => {
+                    format!("Invalid JSON data: {}", e.body_text())
+                }
+                axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
+                    format!("JSON syntax error: {}", e.body_text())
+                }
+                axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
+                    "Content-Type must be application/json".to_string()
+                }
+                axum::extract::rejection::JsonRejection::BytesRejection(_) => {
+                    "Failed to read request body".to_string()
+                }
+                _ => "Invalid JSON payload".to_string(),
+            };
+
+            // Log JSON parsing error
+            crate::security_log::log_validation_failure(
+                client_ip,
+                "body",
+                &message,
+                &path,
+                "POST",
+                &correlation_id,
+                1,
+            );
+
+            ValidationError::single("body", message)
+        })?;
 
         // Step 2: Sanitize the data
         data.sanitize();
 
         // Step 3: Validate the data
-        data.validate().map_err(ValidationError::new)?;
+        data.validate().map_err(|errors| {
+            // Log validation failures with field details
+            for error in &errors {
+                crate::security_log::log_validation_failure(
+                    client_ip,
+                    &error.field,
+                    &error.message,
+                    &path,
+                    "POST",
+                    &correlation_id,
+                    1,
+                );
+            }
+            ValidationError::new(errors)
+        })?;
 
         Ok(ValidatedJson(data))
     }
@@ -250,7 +296,7 @@ mod tests {
     #[test]
     fn test_validation_builder() {
         let mut builder = ValidationBuilder::new();
-        
+
         builder
             .check("name", || Err("is required".to_string()))
             .check("email", || Ok(()))
@@ -261,7 +307,7 @@ mod tests {
 
         let result = builder.build();
         assert!(result.is_err());
-        
+
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].field, "name");
@@ -274,9 +320,9 @@ mod tests {
             FieldError::new("contract_id", "is required"),
             FieldError::new("name", "must be at least 1 character"),
         ];
-        
+
         let response = ValidationErrorResponse::new(errors);
-        
+
         assert_eq!(response.error, "ValidationError");
         assert_eq!(response.code, 400);
         assert_eq!(response.errors.len(), 2);
@@ -287,7 +333,7 @@ mod tests {
     fn test_single_error_response() {
         let errors = vec![FieldError::new("name", "is required")];
         let response = ValidationErrorResponse::new(errors);
-        
+
         assert!(response.message.contains("field 'name'"));
     }
 }

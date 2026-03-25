@@ -9,14 +9,17 @@ use serde::Deserialize;
 use shared::{CustomMetric, CustomMetricAggregate, CustomMetricType, RecordCustomMetricRequest};
 use sqlx::{QueryBuilder, Row};
 
-use crate::{error::{ApiError, ApiResult}, state::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
 
 fn db_error(operation: &str, err: sqlx::Error) -> ApiError {
     tracing::error!(operation, error = ?err, "database operation failed");
     ApiError::internal("Database operation failed")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct MetricQuery {
     pub metric: Option<String>,
     pub resolution: Option<String>,
@@ -25,12 +28,12 @@ pub struct MetricQuery {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct MetricCatalogQuery {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MetricSeriesResponse {
     pub contract_id: String,
     pub metric_name: String,
@@ -39,7 +42,7 @@ pub struct MetricSeriesResponse {
     pub points: Vec<MetricSeriesPoint>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MetricSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub bucket_end: DateTime<Utc>,
@@ -53,7 +56,7 @@ pub struct MetricSeriesPoint {
     pub p99_value: Option<f64>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MetricSampleResponse {
     pub contract_id: String,
     pub metric_name: String,
@@ -62,7 +65,7 @@ pub struct MetricSampleResponse {
     pub samples: Vec<MetricSample>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MetricSample {
     pub timestamp: DateTime<Utc>,
     pub value: f64,
@@ -70,7 +73,7 @@ pub struct MetricSample {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MetricCatalogEntry {
     pub metric_name: String,
     pub metric_type: CustomMetricType,
@@ -78,6 +81,18 @@ pub struct MetricCatalogEntry {
     pub sample_count: i64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/contracts/{id}/metrics/catalog",
+    params(
+        ("id" = String, Path, description = "Contract UUID"),
+        MetricCatalogQuery
+    ),
+    responses(
+        (status = 200, description = "Catalog of available metrics", body = [MetricCatalogEntry])
+    ),
+    tag = "Metrics"
+)]
 pub async fn get_metric_catalog(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -100,8 +115,12 @@ pub async fn get_metric_catalog(
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
         let metric_name: String = row.try_get("metric_name").unwrap_or_default();
-        let metric_type: CustomMetricType = row.try_get("metric_type").map_err(|e| db_error("parse metric_type", e))?;
-        let last_seen: DateTime<Utc> = row.try_get("last_seen").map_err(|e| db_error("parse last_seen", e))?;
+        let metric_type: CustomMetricType = row
+            .try_get("metric_type")
+            .map_err(|e| db_error("parse metric_type", e))?;
+        let last_seen: DateTime<Utc> = row
+            .try_get("last_seen")
+            .map_err(|e| db_error("parse last_seen", e))?;
         let sample_count: i64 = row.try_get("sample_count").unwrap_or(0);
         entries.push(MetricCatalogEntry {
             metric_name,
@@ -114,6 +133,19 @@ pub async fn get_metric_catalog(
     Ok(Json(entries))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/contracts/{id}/metrics",
+    params(
+        ("id" = String, Path, description = "Contract UUID"),
+        MetricQuery
+    ),
+    responses(
+        (status = 200, description = "Time-series metric data", body = Object),
+        (status = 400, description = "Missing or invalid parameters")
+    ),
+    tag = "Metrics"
+)]
 pub async fn get_contract_metrics(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -125,15 +157,11 @@ pub async fn get_contract_metrics(
             return Err(ApiError::bad_request(
                 "MissingMetric",
                 "Query parameter 'metric' is required", // e.g. ?metric=custom_trades_volume
-            ))
+            ));
         }
     };
 
-    let resolution = query
-        .resolution
-        .as_deref()
-        .unwrap_or("hour")
-        .to_lowercase();
+    let resolution = query.resolution.as_deref().unwrap_or("hour").to_lowercase();
 
     let from_ts = query
         .from
@@ -177,13 +205,17 @@ pub async fn get_contract_metrics(
 
         if samples.is_empty() {
             let metric_type = fetch_metric_type(&state, &contract_id, &metric_name).await?;
-            return Ok((StatusCode::OK, Json(MetricSampleResponse {
-                contract_id,
-                metric_name,
-                metric_type,
-                resolution,
-                samples: Vec::new(),
-            })).into_response());
+            return Ok((
+                StatusCode::OK,
+                Json(MetricSampleResponse {
+                    contract_id,
+                    metric_name,
+                    metric_type,
+                    resolution,
+                    samples: Vec::new(),
+                }),
+            )
+                .into_response());
         }
 
         let metric_type = Some(samples[0].metric_type.clone());
@@ -248,13 +280,17 @@ pub async fn get_contract_metrics(
 
     if points.is_empty() {
         let metric_type = fetch_metric_type(&state, &contract_id, &metric_name).await?;
-        return Ok((StatusCode::OK, Json(MetricSeriesResponse {
-            contract_id,
-            metric_name,
-            metric_type,
-            resolution,
-            points: Vec::new(),
-        })).into_response());
+        return Ok((
+            StatusCode::OK,
+            Json(MetricSeriesResponse {
+                contract_id,
+                metric_name,
+                metric_type,
+                resolution,
+                points: Vec::new(),
+            }),
+        )
+            .into_response());
     }
 
     let metric_type = Some(points[0].metric_type.clone());
@@ -269,13 +305,27 @@ pub async fn get_contract_metrics(
                 bucket_start: row.bucket_start,
                 bucket_end: row.bucket_end,
                 sample_count: row.sample_count,
-                sum_value: row.sum_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                avg_value: row.avg_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                min_value: row.min_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                max_value: row.max_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                p50_value: row.p50_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                p95_value: row.p95_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
-                p99_value: row.p99_value.map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                sum_value: row
+                    .sum_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                avg_value: row
+                    .avg_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                min_value: row
+                    .min_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                max_value: row
+                    .max_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                p50_value: row
+                    .p50_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                p95_value: row
+                    .p95_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
+                p99_value: row
+                    .p99_value
+                    .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0)),
             })
             .collect(),
     };
@@ -302,6 +352,19 @@ async fn fetch_metric_type(
     Ok(metric_type)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/contracts/{id}/metrics",
+    params(
+        ("id" = String, Path, description = "Contract UUID")
+    ),
+    request_body = RecordCustomMetricRequest,
+    responses(
+        (status = 201, description = "Metric recorded successfully", body = CustomMetric),
+        (status = 400, description = "Contract mismatch or invalid input")
+    ),
+    tag = "Metrics"
+)]
 pub async fn record_contract_metric(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -341,6 +404,18 @@ pub async fn record_contract_metric(
     Ok(Json(metric))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/contracts/{id}/metrics/batch",
+    params(
+        ("id" = String, Path, description = "Contract UUID")
+    ),
+    request_body = [RecordCustomMetricRequest],
+    responses(
+        (status = 201, description = "Batch of metrics recorded", body = Object)
+    ),
+    tag = "Metrics"
+)]
 pub async fn record_metrics_batch(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,

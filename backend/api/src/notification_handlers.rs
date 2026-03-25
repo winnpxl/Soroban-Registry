@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     disaster_recovery_models::{
-        CreateNotificationTemplateRequest, CreateUserNotificationPreferenceRequest, 
-        NotificationTemplate, SendNotificationRequest, UserNotificationPreference
+        CreateNotificationTemplateRequest, CreateUserNotificationPreferenceRequest,
+        NotificationTemplate, SendNotificationRequest, UserNotificationPreference,
     },
     error::{ApiError, ApiResult},
     state::AppState,
@@ -49,7 +49,9 @@ pub async fn get_notification_template(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-    .ok_or_else(|| ApiError::not_found("notification_template", "Notification template not found"))?;
+    .ok_or_else(|| {
+        ApiError::not_found("notification_template", "Notification template not found")
+    })?;
 
     Ok(Json(template))
 }
@@ -105,34 +107,39 @@ pub async fn send_notification(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-    .ok_or_else(|| ApiError::not_found("notification_template", "Notification template not found"))?;
-    
+    .ok_or_else(|| {
+        ApiError::not_found("notification_template", "Notification template not found")
+    })?;
+
     // Process template with variables
     let mut message = template.message_template.clone();
     for (key, value) in &req.template_variables {
         let placeholder = format!("{{{{{}}}}}", key); // {{variable}}
         message = message.replace(&placeholder, value);
     }
-    
+
     // For now, just log the notification - in a real implementation this would send via email/SMS/etc.
-    println!("Notification sent to {:?}: {} - {}", req.recipients, template.subject, message);
-    
+    println!(
+        "Notification sent to {:?}: {} - {}",
+        req.recipients, template.subject, message
+    );
+
     // In a real system, we'd store the notification in a queue table for processing
     // and track delivery status
-    
+
     // Log the notification for audit purposes
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO notification_logs 
         (contract_id, notification_type, recipients, message, sent_at, status)
         VALUES ($1, $2, $3, $4, $5, 'sent')
         "#,
-        req.contract_id,
-        req.notification_type,
-        &req.recipients,
-        &message,
-        Utc::now()
     )
+    .bind(req.contract_id)
+    .bind(&req.notification_type)
+    .bind(&req.recipients)
+    .bind(&message)
+    .bind(Utc::now())
     .execute(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Failed to log notification: {}", e)))?;
@@ -141,7 +148,7 @@ pub async fn send_notification(
 }
 
 pub async fn get_user_notifications(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(user_id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // In a real system, this would return user-specific notifications

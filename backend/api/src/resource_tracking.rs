@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -57,6 +57,12 @@ pub struct ResourceSummary {
 
 pub struct ResourceManager {
     data: HashMap<String, Vec<ResourceUsage>>,
+}
+
+impl Default for ResourceManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceManager {
@@ -162,8 +168,6 @@ impl ResourceManager {
         let cpu_step_burn_p90 = (cpu_step_burn - Z_P90 * cpu_sigma).max(EPS);
         let mem_step_burn_p90 = (mem_step_burn - Z_P90 * mem_sigma).max(EPS);
 
-        let cpu_exhaust = project_exhaustion(current_cpu, cpu_step_burn, MAX_CPU as f64, last_ts, dt);
-        let mem_exhaust = project_exhaustion(current_mem, mem_step_burn, MAX_MEM as f64, last_ts, dt);
         let cpu_exhaust =
             project_exhaustion(current_cpu, cpu_step_burn, MAX_CPU as f64, last_ts, dt);
         let mem_exhaust =
@@ -175,8 +179,6 @@ impl ResourceManager {
 
         let n = cpu_deltas.len().max(mem_deltas.len()) as f64;
         let variance_penalty = (cpu_sigma + mem_sigma) / (cpu_step_burn + mem_step_burn + 1.0);
-        let confidence = ((1.0 - 1.0 / (n + 1.0)) * (1.0 - variance_penalty))
-            .clamp(0.0, 0.99);
         let confidence = ((1.0 - 1.0 / (n + 1.0)) * (1.0 - variance_penalty)).clamp(0.0, 0.99);
 
         UsageForecast {
@@ -281,6 +283,7 @@ fn project_exhaustion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn rising(n: usize) -> Vec<ResourceUsage> {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
@@ -311,7 +314,7 @@ mod tests {
         let mut mgr = ResourceManager::new();
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         for i in 0..72_u64 {
-            let noise = ((i % 5) * 25_000) as u64;
+            let noise = (i % 5) * 25_000;
             mgr.record_usage(
                 "cp90",
                 ResourceUsage {

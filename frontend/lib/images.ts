@@ -1,3 +1,5 @@
+import { decode } from 'blurhash';
+
 /**
  * Image utility functions and constants for optimized image rendering
  */
@@ -111,10 +113,99 @@ export function getGridSizes(columnCount: number): string {
 
 /**
  * Generates a low-quality image placeholder (LQIP) data URL
- * This is a simple implementation - in production you might use blurhash
+ * SVG color fallback used when blurhash is unavailable
  */
 export function generateSolidPlaceholder(color: string): string {
   return `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect fill='${encodeURIComponent(color)}'/%3E%3C/svg%3E`;
+}
+
+export interface BlurHashDecodeOptions {
+  width?: number;
+  height?: number;
+  punch?: number;
+  fallbackColor?: string;
+}
+
+function canUseCanvas(): boolean {
+  return typeof document !== 'undefined';
+}
+
+function createCanvas(width: number, height: number): HTMLCanvasElement | null {
+  if (!canUseCanvas()) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+function toPngDataUrl(
+  pixels: Uint8ClampedArray,
+  width: number,
+  height: number
+): string | null {
+  const canvas = createCanvas(width, height);
+  if (!canvas) return null;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const imageData = ctx.createImageData(width, height);
+  imageData.data.set(pixels);
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
+function averageColorFromRgba(pixels: Uint8ClampedArray): string {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let weight = 0;
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const alpha = pixels[i + 3] / 255;
+    if (alpha <= 0) continue;
+    r += pixels[i] * alpha;
+    g += pixels[i + 1] * alpha;
+    b += pixels[i + 2] * alpha;
+    weight += alpha;
+  }
+
+  if (weight === 0) {
+    return '#e5e7eb';
+  }
+
+  const rr = Math.round(r / weight);
+  const gg = Math.round(g / weight);
+  const bb = Math.round(b / weight);
+  return `#${[rr, gg, bb].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * Decodes a blurhash into a PNG data URL for `next/image` blur placeholders.
+ * Falls back to a solid-color SVG if decoding/canvas is unavailable.
+ */
+export function generateBlurHashPlaceholder(
+  blurHash: string | null | undefined,
+  options: BlurHashDecodeOptions = {}
+): string {
+  const {
+    width = 32,
+    height = 32,
+    punch = 1,
+    fallbackColor = '#e5e7eb',
+  } = options;
+
+  if (!blurHash) {
+    return generateSolidPlaceholder(fallbackColor);
+  }
+
+  try {
+    const pixels = decode(blurHash, width, height, punch);
+    const dataUrl = toPngDataUrl(pixels, width, height);
+    return dataUrl ?? generateSolidPlaceholder(fallbackColor);
+  } catch {
+    return generateSolidPlaceholder(fallbackColor);
+  }
 }
 
 /**

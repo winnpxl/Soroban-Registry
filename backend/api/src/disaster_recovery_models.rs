@@ -1,4 +1,3 @@
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -8,8 +7,8 @@ use uuid::Uuid;
 pub struct DisasterRecoveryPlan {
     pub id: Uuid,
     pub contract_id: Uuid,
-    pub rto_minutes: i32,      // Recovery Time Objective in minutes
-    pub rpo_minutes: i32,      // Recovery Point Objective in minutes
+    pub rto_minutes: i32, // Recovery Time Objective in minutes
+    pub rpo_minutes: i32, // Recovery Point Objective in minutes
     pub recovery_strategy: String,
     pub backup_frequency_minutes: i32,
     pub created_at: DateTime<Utc>,
@@ -67,7 +66,42 @@ pub struct PostIncidentReport {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Database row type for PostIncidentReport (without nested action_items)
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct PostIncidentReportRow {
+    pub id: Uuid,
+    pub incident_id: Uuid,
+    pub contract_id: Uuid,
+    pub title: String,
+    pub description: String,
+    pub root_cause: String,
+    pub impact_assessment: String,
+    pub recovery_steps: Vec<String>,
+    pub lessons_learned: Vec<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl PostIncidentReportRow {
+    pub fn into_report(self, action_items: Vec<ActionItem>) -> PostIncidentReport {
+        PostIncidentReport {
+            id: self.id,
+            incident_id: self.incident_id,
+            contract_id: self.contract_id,
+            title: self.title,
+            description: self.description,
+            root_cause: self.root_cause,
+            impact_assessment: self.impact_assessment,
+            recovery_steps: self.recovery_steps,
+            lessons_learned: self.lessons_learned,
+            action_items,
+            created_by: self.created_by,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ActionItem {
     pub id: Uuid,
     pub description: String,
@@ -98,10 +132,10 @@ pub struct CreateActionItemRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct NotificationTemplate {
     pub id: Uuid,
-    pub name: String,           // e.g., 'recovery_started', 'recovery_completed'
+    pub name: String, // e.g., 'recovery_started', 'recovery_completed'
     pub subject: String,
     pub message_template: String, // Template with placeholders
-    pub channel: String,        // 'email', 'sms', 'push', 'webhook'
+    pub channel: String,          // 'email', 'sms', 'push', 'webhook'
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -118,9 +152,9 @@ pub struct CreateNotificationTemplateRequest {
 pub struct UserNotificationPreference {
     pub id: Uuid,
     pub user_id: Uuid,
-    pub contract_id: Option<Uuid>,  // If null, applies to all contracts
+    pub contract_id: Option<Uuid>, // If null, applies to all contracts
     pub notification_types: Vec<String>, // ['recovery_started', 'recovery_completed', 'incident_detected']
-    pub channels: Vec<String>,     // ['email', 'sms', 'push']
+    pub channels: Vec<String>,           // ['email', 'sms', 'push']
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

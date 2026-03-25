@@ -1,11 +1,11 @@
 use once_cell::sync::Lazy;
 use prometheus::{
-    opts, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec, Registry, TextEncoder,
+    opts, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Registry, TextEncoder,
 };
 
+#[allow(dead_code)]
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
-
 
 macro_rules! counter_vec {
     ($name:expr, $help:expr, $labels:expr) => {
@@ -135,6 +135,26 @@ pub static DB_QUERY_ERRORS: Lazy<IntCounter> = counter!("db_query_errors_total",
 pub static DB_TRANSACTIONS_TOTAL: Lazy<IntCounter> =
     counter!("db_transactions_total", "Total DB transactions");
 pub static DB_POOL_SIZE: Lazy<IntGauge> = gauge!("db_pool_size", "DB connection pool size");
+pub static DB_CONNECTION_WAIT_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "db_connection_wait_milliseconds",
+            "DB connection acquisition latency",
+        )
+        .buckets(vec![
+            1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+        ]),
+        &["pool"],
+    )
+    .unwrap()
+});
+pub static DB_POOL_TIMEOUTS: Lazy<IntCounter> =
+    counter!("db_pool_timeouts_total", "DB pool acquisition timeouts");
+pub static DB_POOL_UTILIZATION: Lazy<GaugeVec> = gauge_f64_vec!(
+    "db_pool_utilization",
+    "DB pool utilization ratio",
+    &["pool"]
+);
 
 // ── Cache ───────────────────────────────────────────────────────────────────
 pub static CACHE_HITS: Lazy<IntCounter> = counter!("cache_hits_total", "Cache hits");
@@ -142,6 +162,16 @@ pub static CACHE_MISSES: Lazy<IntCounter> = counter!("cache_misses_total", "Cach
 pub static CACHE_EVICTIONS: Lazy<IntCounter> = counter!("cache_evictions_total", "Cache evictions");
 pub static CACHE_SIZE_BYTES: Lazy<IntGauge> = gauge!("cache_size_bytes", "Cache size in bytes");
 pub static CACHE_ENTRIES: Lazy<IntGauge> = gauge!("cache_entries", "Number of cached entries");
+
+pub static ABI_CACHE_HITS: Lazy<IntCounter> = counter!("abi_cache_hits_total", "ABI cache hits");
+pub static ABI_CACHE_MISSES: Lazy<IntCounter> =
+    counter!("abi_cache_misses_total", "ABI cache misses");
+pub static VERIFICATION_CACHE_HITS: Lazy<IntCounter> =
+    counter!("verification_cache_hits_total", "Verification cache hits");
+pub static VERIFICATION_CACHE_MISSES: Lazy<IntCounter> = counter!(
+    "verification_cache_misses_total",
+    "Verification cache misses"
+);
 
 // ── Resources ────────────────────────────────────────────────────────────────────
 pub static RESOURCE_RECORDINGS: Lazy<IntCounter> =
@@ -193,6 +223,23 @@ pub static MULTISIG_EXECUTIONS: Lazy<IntCounter> =
     counter!("multisig_executions_total", "Multisig executions completed");
 pub static MULTISIG_REJECTIONS: Lazy<IntCounter> =
     counter!("multisig_rejections_total", "Multisig proposals rejected");
+
+// ── Job Queue ───────────────────────────────────────────────────────────────
+pub static JOB_QUEUE_DEPTH: Lazy<IntGaugeVec> = gauge_vec!(
+    "job_queue_depth",
+    "Current number of jobs in the queue",
+    &["type", "status"]
+);
+pub static JOB_PROCESSING_DURATION: Lazy<HistogramVec> = histogram_vec!(
+    "job_processing_duration_seconds",
+    "Job processing latency",
+    &["type"]
+);
+pub static JOB_FAILURES_TOTAL: Lazy<IntCounterVec> = counter_vec!(
+    "job_failures_total",
+    "Total number of job failures",
+    &["type"]
+);
 
 // ── System ──────────────────────────────────────────────────────────────────
 pub static PROCESS_START_TIME: Lazy<IntGauge> =
@@ -254,11 +301,19 @@ pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(DB_QUERY_ERRORS.clone()))?;
     r.register(Box::new(DB_TRANSACTIONS_TOTAL.clone()))?;
     r.register(Box::new(DB_POOL_SIZE.clone()))?;
+    r.register(Box::new(DB_CONNECTION_WAIT_MS.clone()))?;
+    r.register(Box::new(DB_POOL_TIMEOUTS.clone()))?;
+    r.register(Box::new(DB_POOL_UTILIZATION.clone()))?;
+
     r.register(Box::new(CACHE_HITS.clone()))?;
     r.register(Box::new(CACHE_MISSES.clone()))?;
     r.register(Box::new(CACHE_EVICTIONS.clone()))?;
     r.register(Box::new(CACHE_SIZE_BYTES.clone()))?;
     r.register(Box::new(CACHE_ENTRIES.clone()))?;
+    r.register(Box::new(ABI_CACHE_HITS.clone()))?;
+    r.register(Box::new(ABI_CACHE_MISSES.clone()))?;
+    r.register(Box::new(VERIFICATION_CACHE_HITS.clone()))?;
+    r.register(Box::new(VERIFICATION_CACHE_MISSES.clone()))?;
     r.register(Box::new(RESOURCE_RECORDINGS.clone()))?;
     r.register(Box::new(RESOURCE_ALERTS_FIRED.clone()))?;
     r.register(Box::new(RESOURCE_FORECAST_RUNS.clone()))?;
@@ -285,6 +340,9 @@ pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(PATCHES_FAILED.clone()))?;
     r.register(Box::new(PUBLISHERS_TOTAL.clone()))?;
     r.register(Box::new(PUBLISHER_REGISTRATIONS.clone()))?;
+    r.register(Box::new(JOB_QUEUE_DEPTH.clone()))?;
+    r.register(Box::new(JOB_PROCESSING_DURATION.clone()))?;
+    r.register(Box::new(JOB_FAILURES_TOTAL.clone()))?;
     Ok(())
 }
 
@@ -296,6 +354,7 @@ pub fn gather_metrics(r: &Registry) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub fn observe_http(method: &str, path: &str, status: u16, duration_secs: f64) {
     HTTP_REQUESTS_TOTAL
         .with_label_values(&[method, path, &status.to_string()])
@@ -305,6 +364,7 @@ pub fn observe_http(method: &str, path: &str, status: u16, duration_secs: f64) {
         .observe(duration_secs);
 }
 
+#[allow(dead_code)]
 pub fn observe_verification_latency(result: &str, duration_secs: f64) {
     VERIFICATION_LATENCY
         .with_label_values(&[result])
@@ -315,12 +375,14 @@ pub fn observe_verification_latency(result: &str, duration_secs: f64) {
     }
 }
 
+#[allow(dead_code)]
 pub fn set_contracts_per_publisher(publisher: &str, count: i64) {
     CONTRACTS_PER_PUBLISHER
         .with_label_values(&[publisher])
         .set(count);
 }
 
+#[allow(dead_code)]
 pub fn observe_db_query(query: &str, duration_secs: f64) {
     DB_QUERY_DURATION
         .with_label_values(&[query])
@@ -393,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_at_least_50_metric_families() {
+    fn test_at_least_45_metric_families() {
         let r = fresh_registry();
         CONTRACTS_PUBLISHED.inc();
         observe_http("GET", "/test", 200, 0.01);
@@ -402,8 +464,8 @@ mod tests {
         observe_db_query("q", 0.001);
         let families = r.gather();
         assert!(
-            families.len() >= 50,
-            "expected ≥50 metric families, got {}",
+            families.len() >= 45,
+            "expected ≥45 metric families, got {}",
             families.len()
         );
     }

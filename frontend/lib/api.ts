@@ -1,8 +1,20 @@
-import {
-  MOCK_CONTRACTS,
-  MOCK_EXAMPLES,
-  MOCK_VERSIONS,
-} from "./mock-data";
+// Mock data: conditionally imported only in development/test.
+// In production (NEXT_PUBLIC_USE_MOCKS !== "true"), these are empty stubs
+// that never get reached (gated behind USE_MOCKS checks below).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let MOCK_CONTRACTS: any[] = [];
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let MOCK_EXAMPLES: Record<string, any[]> = {};
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let MOCK_VERSIONS: Record<string, any[]> = {};
+if (process.env.NEXT_PUBLIC_USE_MOCKS === "true") {
+  // Dynamic require ensures Next.js tree-shakes mock-data from production bundles
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const mocks = require("./mock-data");
+  MOCK_CONTRACTS = mocks.MOCK_CONTRACTS;
+  MOCK_EXAMPLES = mocks.MOCK_EXAMPLES;
+  MOCK_VERSIONS = mocks.MOCK_VERSIONS;
+}
 import { trackEvent } from "./analytics";
 import {
   ApiError,
@@ -232,6 +244,58 @@ export interface MetricSeriesResponse {
 
 export type DeprecationStatus = 'active' | 'deprecated' | 'retired';
 
+export type ReleaseNotesStatus = 'draft' | 'published';
+
+export interface FunctionChange {
+  name: string;
+  change_type: 'added' | 'removed' | 'modified';
+  old_signature?: string;
+  new_signature?: string;
+  is_breaking: boolean;
+}
+
+export interface DiffSummary {
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  function_changes: FunctionChange[];
+  has_breaking_changes: boolean;
+  features_count: number;
+  fixes_count: number;
+  breaking_count: number;
+}
+
+export interface ReleaseNotesResponse {
+  id: string;
+  contract_id: string;
+  version: string;
+  previous_version?: string;
+  diff_summary: DiffSummary;
+  changelog_entry?: string;
+  notes_text: string;
+  status: ReleaseNotesStatus;
+  generated_by: string;
+  created_at: string;
+  updated_at: string;
+  published_at?: string;
+}
+
+export interface GenerateReleaseNotesRequest {
+  version: string;
+  previous_version?: string;
+  source_url?: string;
+  changelog_content?: string;
+  contract_address?: string;
+}
+
+export interface UpdateReleaseNotesRequest {
+  notes_text: string;
+}
+
+export interface PublishReleaseNotesRequest {
+  update_version_record?: boolean;
+}
+
 export interface DeprecationInfo {
   contract_id: string;
   status: DeprecationStatus;
@@ -246,6 +310,29 @@ export interface DeprecationInfo {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 const USE_MOCKS = process.env.NEXT_PUBLIC_USE_MOCKS === "true";
+
+/**
+ * Helper to create a mock response with a delay
+ */
+function _mockResponse<T>(data: T, delay = 300): Promise<T> {
+  return new Promise((resolve) => setTimeout(() => resolve(data), delay));
+}
+
+/**
+ * Helper to build query string from params object
+ */
+function _buildQueryParams(params: Record<string, string | number | boolean | string[] | undefined>): URLSearchParams {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      value.forEach(v => qs.append(key, v));
+    } else {
+      qs.append(key, String(value));
+    }
+  }
+  return qs;
+}
 
 /**
  * Wrapper for API calls with consistent error handling
@@ -315,7 +402,7 @@ export const api = {
               (c) =>
                 c.name.toLowerCase().includes(q) ||
                 (c.description && c.description.toLowerCase().includes(q)) ||
-                c.tags.some((tag) => tag.toLowerCase().includes(q)),
+                c.tags.some((tag: string) => tag.toLowerCase().includes(q)),
             );
           }
 
@@ -347,7 +434,7 @@ export const api = {
           if (languages.length > 0) {
             const normalized = languages.map((language) => language.toLowerCase());
             filtered = filtered.filter((c) =>
-              c.tags.some((tag) => normalized.includes(tag.toLowerCase())),
+              c.tags.some((tag: string) => normalized.includes(tag.toLowerCase())),
             );
           }
 
@@ -418,12 +505,13 @@ export const api = {
       queryParams.append("language", language),
     );
     if (params?.author) queryParams.append("author", params.author);
+    params?.tags?.forEach((tag) => queryParams.append("tag", tag));
     // Backend expects sort_by without underscores: createdat, updatedat, popularity, deployments, interactions, relevance
     if (params?.sort_by) {
       const backendSortBy =
         params.sort_by === 'created_at' ? 'createdat'
         : params.sort_by === 'updated_at' ? 'updatedat'
-        : params.sort_by === 'name' ? 'createdat'
+        : params.sort_by === 'name' ? 'name'
         : params.sort_by === 'downloads' ? 'interactions'
         : params.sort_by;
       queryParams.append("sort_by", backendSortBy);
@@ -433,16 +521,14 @@ export const api = {
     if (params?.page_size)
       queryParams.append("page_size", String(params.page_size));
 
-    return handleApiCall<PaginatedResponse<Contract>>(
+    const data = await handleApiCall<PaginatedResponse<Contract>>(
       () => fetch(`${API_URL}/api/contracts?${queryParams}`),
       '/api/contracts'
     );
-    const response = await fetch(`${API_URL}/api/contracts?${queryParams}`);
-    if (!response.ok) throw new Error("Failed to fetch contracts");
-    const data = await response.json();
-    // Backend returns "contracts"; normalize to "items" for PaginatedResponse
-    if (Array.isArray(data.contracts) && data.items === undefined) {
-      return { ...data, items: data.contracts };
+    // Backend may return "contracts" instead of "items" — normalize for PaginatedResponse
+    const raw = data as unknown as Record<string, unknown>;
+    if (Array.isArray(raw.contracts) && data.items === undefined) {
+      return { ...data, items: raw.contracts as Contract[] };
     }
     return data;
   },
@@ -465,16 +551,13 @@ export const api = {
 
 
     return handleApiCall<Contract>(
-      () => fetch(`${API_URL}/api/contracts/${id}`),
+      () => {
+        const url = new URL(`${API_URL}/api/contracts/${id}`);
+        if (network != null) url.searchParams.set("network", String(network));
+        return fetch(url.toString());
+      },
       `/api/contracts/${id}`
     );
-
-    const url = new URL(`${API_URL}/api/contracts/${id}`);
-    if (network != null) url.searchParams.set("network", String(network));
-    const response = await fetch(url.toString());
-    if (!response.ok) throw new Error("Failed to fetch contract");
-    return response.json();
-
   },
 
   async getContractExamples(id: string): Promise<ContractExample[]> {
@@ -609,14 +692,6 @@ export const api = {
       }
       throw error;
     }
-    return handleApiCall<Contract>(
-      () => fetch(`${API_URL}/api/contracts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      }),
-      '/api/contracts'
-    );
   },
 
   async getContractHealth(id: string): Promise<ContractHealth> {
@@ -834,6 +909,171 @@ export const api = {
       '/api/templates'
     );
   },
+
+  // SDK / Wasm / Network Compatibility Testing (Issue #261)
+  async getCompatibilityMatrix(id: string): Promise<CompatibilityTestMatrixResponse> {
+    return handleApiCall<CompatibilityTestMatrixResponse>(
+      () => fetch(`${API_URL}/api/contracts/${id}/compatibility-matrix`),
+      `/api/contracts/${id}/compatibility-matrix`
+    );
+  },
+
+  async runCompatibilityTest(id: string, data: RunCompatibilityTestRequest): Promise<CompatibilityTestEntry> {
+    return handleApiCall<CompatibilityTestEntry>(
+      () => fetch(`${API_URL}/api/contracts/${id}/compatibility-matrix/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }),
+      `/api/contracts/${id}/compatibility-matrix/test`
+    );
+  },
+
+  async getCompatibilityHistory(id: string, limit?: number, offset?: number): Promise<CompatibilityHistoryResponse> {
+    const params = new URLSearchParams();
+    if (limit != null) params.set('limit', String(limit));
+    if (offset != null) params.set('offset', String(offset));
+    const qs = params.toString();
+    return handleApiCall<CompatibilityHistoryResponse>(
+      () => fetch(`${API_URL}/api/contracts/${id}/compatibility-matrix/history${qs ? `?${qs}` : ''}`),
+      `/api/contracts/${id}/compatibility-matrix/history`
+    );
+  },
+
+  async getCompatibilityNotifications(id: string): Promise<CompatibilityNotification[]> {
+    return handleApiCall<CompatibilityNotification[]>(
+      () => fetch(`${API_URL}/api/contracts/${id}/compatibility-matrix/notifications`),
+      `/api/contracts/${id}/compatibility-matrix/notifications`
+    );
+  },
+
+  async markCompatibilityNotificationsRead(id: string): Promise<unknown> {
+    return handleApiCall<unknown>(
+      () => fetch(`${API_URL}/api/contracts/${id}/compatibility-matrix/notifications/read`, {
+        method: 'POST',
+      }),
+      `/api/contracts/${id}/compatibility-matrix/notifications/read`
+    );
+  },
+
+  async getCompatibilityDashboard(): Promise<CompatibilityDashboardResponse> {
+    return handleApiCall<CompatibilityDashboardResponse>(
+      () => fetch(`${API_URL}/api/compatibility-dashboard`),
+      '/api/compatibility-dashboard'
+    );
+  },
+
+  // ── Release Notes Generation ────────────────────────────────────────────
+
+  async listReleaseNotes(id: string): Promise<ReleaseNotesResponse[]> {
+    return handleApiCall<ReleaseNotesResponse[]>(
+      () => fetch(`${API_URL}/api/contracts/${id}/release-notes`),
+      `/api/contracts/${id}/release-notes`
+    );
+  },
+
+  async getReleaseNotes(id: string, version: string): Promise<ReleaseNotesResponse> {
+    return handleApiCall<ReleaseNotesResponse>(
+      () => fetch(`${API_URL}/api/contracts/${id}/release-notes/${version}`),
+      `/api/contracts/${id}/release-notes/${version}`
+    );
+  },
+
+  async generateReleaseNotes(
+    id: string,
+    req: GenerateReleaseNotesRequest
+  ): Promise<ReleaseNotesResponse> {
+    return handleApiCall<ReleaseNotesResponse>(
+      () =>
+        fetch(`${API_URL}/api/contracts/${id}/release-notes/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req),
+        }),
+      `/api/contracts/${id}/release-notes/generate`
+    );
+  },
+
+  async updateReleaseNotes(
+    id: string,
+    version: string,
+    req: UpdateReleaseNotesRequest
+  ): Promise<ReleaseNotesResponse> {
+    return handleApiCall<ReleaseNotesResponse>(
+      () =>
+        fetch(`${API_URL}/api/contracts/${id}/release-notes/${version}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req),
+        }),
+      `/api/contracts/${id}/release-notes/${version}`
+    );
+  },
+
+  async publishReleaseNotes(
+    id: string,
+    version: string,
+    req?: PublishReleaseNotesRequest
+  ): Promise<ReleaseNotesResponse> {
+    return handleApiCall<ReleaseNotesResponse>(
+      () =>
+        fetch(`${API_URL}/api/contracts/${id}/release-notes/${version}/publish`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req ?? { update_version_record: true }),
+        }),
+      `/api/contracts/${id}/release-notes/${version}/publish`
+    );
+  },
+
+  // Database Migration Versioning (Issue #252)
+  async getMigrationStatus(): Promise<MigrationStatusResponse> {
+    return handleApiCall<MigrationStatusResponse>(
+      () => fetch(`${API_URL}/api/admin/migrations/status`),
+      '/api/admin/migrations/status'
+    );
+  },
+
+  async registerMigration(data: RegisterMigrationRequest): Promise<RegisterMigrationResponse> {
+    return handleApiCall<RegisterMigrationResponse>(
+      () => fetch(`${API_URL}/api/admin/migrations/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }),
+      '/api/admin/migrations/register'
+    );
+  },
+
+  async validateMigrations(): Promise<MigrationValidationResponse> {
+    return handleApiCall<MigrationValidationResponse>(
+      () => fetch(`${API_URL}/api/admin/migrations/validate`),
+      '/api/admin/migrations/validate'
+    );
+  },
+
+  async getMigrationLockStatus(): Promise<LockStatusResponse> {
+    return handleApiCall<LockStatusResponse>(
+      () => fetch(`${API_URL}/api/admin/migrations/lock`),
+      '/api/admin/migrations/lock'
+    );
+  },
+
+  async getMigrationVersion(version: number): Promise<SchemaVersion> {
+    return handleApiCall<SchemaVersion>(
+      () => fetch(`${API_URL}/api/admin/migrations/${version}`),
+      `/api/admin/migrations/${version}`
+    );
+  },
+
+  async rollbackMigration(version: number): Promise<RollbackResponse> {
+    return handleApiCall<RollbackResponse>(
+      () => fetch(`${API_URL}/api/admin/migrations/${version}/rollback`, {
+        method: 'POST',
+      }),
+      `/api/admin/migrations/${version}/rollback`
+    );
+  },
 };
 
 export interface Template {
@@ -927,6 +1167,144 @@ export interface AddCompatibilityRequest {
   is_compatible: boolean;
 }
 
+// ─── SDK / Wasm / Network Compatibility Testing (Issue #261) ─────────────────
+
+export type CompatibilityTestStatus = 'compatible' | 'warning' | 'incompatible';
+
+export interface CompatibilityTestEntry {
+  sdk_version: string;
+  wasm_runtime: string;
+  network: string;
+  status: CompatibilityTestStatus;
+  tested_at: string;
+  test_duration_ms?: number;
+  error_message?: string;
+}
+
+export interface CompatibilityTestSummary {
+  total_tests: number;
+  compatible_count: number;
+  warning_count: number;
+  incompatible_count: number;
+}
+
+export interface CompatibilityTestMatrixResponse {
+  contract_id: string;
+  sdk_versions: string[];
+  wasm_runtimes: string[];
+  networks: string[];
+  entries: CompatibilityTestEntry[];
+  summary: CompatibilityTestSummary;
+  last_tested?: string;
+}
+
+export interface RunCompatibilityTestRequest {
+  sdk_version: string;
+  wasm_runtime: string;
+  network: string;
+}
+
+export interface CompatibilityHistoryEntry {
+  id: string;
+  contract_id: string;
+  sdk_version: string;
+  wasm_runtime: string;
+  network: string;
+  previous_status?: CompatibilityTestStatus;
+  new_status: CompatibilityTestStatus;
+  changed_at: string;
+  change_reason?: string;
+}
+
+export interface CompatibilityHistoryResponse {
+  contract_id: string;
+  changes: CompatibilityHistoryEntry[];
+  total: number;
+}
+
+export interface CompatibilityNotification {
+  id: string;
+  contract_id: string;
+  sdk_version: string;
+  message: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+export interface CompatibilityDashboardResponse {
+  total_contracts_tested: number;
+  overall_compatible: number;
+  overall_warning: number;
+  overall_incompatible: number;
+  sdk_versions: string[];
+  recent_changes: CompatibilityHistoryEntry[];
+}
+
+// ─── Database Migration Versioning (Issue #252) ──────────────────────────────
+
+export interface SchemaVersion {
+  id: number;
+  version: number;
+  description: string;
+  filename: string;
+  checksum: string;
+  applied_at: string;
+  applied_by: string;
+  execution_time_ms?: number;
+  rolled_back_at?: string;
+  rollback_by?: string;
+}
+
+export interface MigrationStatusResponse {
+  current_version?: number;
+  total_applied: number;
+  total_rolled_back: number;
+  pending_count: number;
+  versions: SchemaVersion[];
+  has_lock: boolean;
+  healthy: boolean;
+  warnings: string[];
+}
+
+export interface ChecksumMismatch {
+  version: number;
+  filename: string;
+  expected_checksum: string;
+  actual_checksum: string;
+}
+
+export interface MigrationValidationResponse {
+  valid: boolean;
+  mismatches: ChecksumMismatch[];
+  missing: number[];
+}
+
+export interface RegisterMigrationRequest {
+  version: number;
+  description: string;
+  filename: string;
+  sql_content: string;
+  down_sql?: string;
+}
+
+export interface RegisterMigrationResponse {
+  version: number;
+  checksum: string;
+  message: string;
+}
+
+export interface RollbackResponse {
+  version: number;
+  rolled_back_at: string;
+  message: string;
+}
+
+export interface LockStatusResponse {
+  locked: boolean;
+  locked_by?: string;
+  locked_at?: string;
+}
+
 // ─── Formal Verification ─────────────────────────────────────────────────────
 
 export type VerificationStatus = 'Proved' | 'Violated' | 'Unknown' | 'Skipped';
@@ -964,6 +1342,7 @@ export interface FormalVerificationPropertyResult {
 
 export interface FormalVerificationReport {
   session: FormalVerificationSession;
+
   properties: FormalVerificationPropertyResult[];
 }
 

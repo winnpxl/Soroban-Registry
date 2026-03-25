@@ -7,12 +7,13 @@ use chrono::{NaiveDate, Utc};
 use shared::models::{
     BackupRestoration, ContractBackup, CreateBackupRequest, RestoreBackupRequest,
 };
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
     disaster_recovery_models::{
-        CreateDisasterRecoveryPlanRequest, DisasterRecoveryPlan, ExecuteRecoveryRequest, 
-        RecoveryMetrics, RecoveryNotification
+        CreateDisasterRecoveryPlanRequest, DisasterRecoveryPlan, ExecuteRecoveryRequest,
+        RecoveryMetrics,
     },
     error::{ApiError, ApiResult},
     state::AppState,
@@ -23,14 +24,15 @@ pub async fn create_backup(
     Path(contract_id): Path<Uuid>,
     Json(req): Json<CreateBackupRequest>,
 ) -> ApiResult<Json<ContractBackup>> {
-    let contract = sqlx::query!("SELECT * FROM contracts WHERE id = $1", contract_id)
+    let contract: shared::Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(contract_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
         .ok_or_else(|| ApiError::not_found("contract", "Contract not found"))?;
 
     let backup_date = Utc::now().date_naive();
-    
+
     let metadata = serde_json::json!({
         "name": contract.name,
         "description": contract.description,
@@ -108,10 +110,12 @@ pub async fn restore_backup(
     // Simulate restoration
     let duration_ms = start.elapsed().as_millis() as i32;
 
-    let contract = sqlx::query!("SELECT publisher_id FROM contracts WHERE id = $1", contract_id)
+    let contract = sqlx::query("SELECT publisher_id FROM contracts WHERE id = $1")
+        .bind(contract_id)
         .fetch_one(&state.db)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+    let publisher_id: Uuid = contract.get("publisher_id");
 
     let restoration = sqlx::query_as::<_, BackupRestoration>(
         r#"
@@ -121,7 +125,7 @@ pub async fn restore_backup(
         "#,
     )
     .bind(backup.id)
-    .bind(contract.publisher_id)
+    .bind(publisher_id)
     .bind(duration_ms)
     .bind(true)
     .fetch_one(&state.db)
@@ -154,7 +158,7 @@ pub async fn get_backup_stats(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let stats = sqlx::query!(
+    let stats = sqlx::query(
         r#"
         SELECT 
             COUNT(*) as total_backups,
@@ -164,17 +168,22 @@ pub async fn get_backup_stats(
         FROM contract_backups 
         WHERE contract_id = $1
         "#,
-        contract_id
     )
+    .bind(contract_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
+    let total_backups: Option<i64> = stats.get("total_backups");
+    let verified_backups: Option<i64> = stats.get("verified_backups");
+    let total_size_bytes: Option<i64> = stats.get("total_size_bytes");
+    let latest_backup: Option<chrono::NaiveDate> = stats.get("latest_backup");
+
     Ok(Json(serde_json::json!({
-        "total_backups": stats.total_backups.unwrap_or(0),
-        "verified_backups": stats.verified_backups.unwrap_or(0),
-        "total_size_bytes": stats.total_size_bytes.unwrap_or(0),
-        "latest_backup": stats.latest_backup,
+        "total_backups": total_backups.unwrap_or(0),
+        "verified_backups": verified_backups.unwrap_or(0),
+        "total_size_bytes": total_size_bytes.unwrap_or(0),
+        "latest_backup": latest_backup,
     })))
 }
 
@@ -218,7 +227,9 @@ pub async fn get_disaster_recovery_plan(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-    .ok_or_else(|| ApiError::not_found("disaster_recovery_plan", "Disaster recovery plan not found"))?;
+    .ok_or_else(|| {
+        ApiError::not_found("disaster_recovery_plan", "Disaster recovery plan not found")
+    })?;
 
     Ok(Json(drp))
 }
@@ -229,57 +240,61 @@ pub async fn execute_recovery(
     Json(req): Json<ExecuteRecoveryRequest>,
 ) -> ApiResult<Json<RecoveryMetrics>> {
     let start_time = std::time::Instant::now();
-    
+
     // Find the most recent backup based on RPO requirements
     let backup_date = if let Some(target) = req.recovery_target {
         if target == "latest" {
             // Get the latest backup
-            sqlx::query_scalar!(
-                "SELECT backup_date FROM contract_backups WHERE contract_id = $1 ORDER BY backup_date DESC LIMIT 1",
-                contract_id
+            let row: Option<(chrono::NaiveDate,)> = sqlx::query_as(
+                "SELECT backup_date FROM contract_backups WHERE contract_id = $1 ORDER BY backup_date DESC LIMIT 1"
             )
+            .bind(contract_id)
             .fetch_optional(&state.db)
             .await
-            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-            .ok_or_else(|| ApiError::not_found("backup", "No backups found for contract"))?        
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+            row.map(|r| r.0)
+                .ok_or_else(|| ApiError::not_found("backup", "No backups found for contract"))?
         } else {
             NaiveDate::parse_from_str(&target, "%Y-%m-%d")
-                .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?    
+                .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?
         }
     } else {
         // Get the latest backup within RPO window
-        let rpo_minutes = sqlx::query_scalar!(
+        let row: Option<(i32,)> = sqlx::query_as(
             "SELECT rpo_minutes FROM disaster_recovery_plans WHERE contract_id = $1",
-            contract_id
         )
+        .bind(contract_id)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .unwrap_or(5); // Default to 5 minutes if no DRP exists
-        
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+        let rpo_minutes = row.map(|r| r.0).unwrap_or(5); // Default to 5 minutes if no DRP exists
+
         let cutoff_date = (Utc::now() - chrono::Duration::minutes(rpo_minutes as i64)).date_naive();
-        
-        sqlx::query_scalar!(
-            "SELECT backup_date FROM contract_backups WHERE contract_id = $1 AND backup_date >= $2 ORDER BY backup_date DESC LIMIT 1",
-            contract_id,
-            cutoff_date
+
+        let row: Option<(chrono::NaiveDate,)> = sqlx::query_as(
+            "SELECT backup_date FROM contract_backups WHERE contract_id = $1 AND backup_date >= $2 ORDER BY backup_date DESC LIMIT 1"
         )
+        .bind(contract_id)
+        .bind(cutoff_date)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("backup", "No recent backup found within RPO window"))?        
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+        row.map(|r| r.0).ok_or_else(|| {
+            ApiError::not_found("backup", "No recent backup found within RPO window")
+        })?
     };
-    
+
     // Perform the restoration
     let restore_req = RestoreBackupRequest {
         backup_date: backup_date.to_string(),
     };
-    
-    let restoration = restore_backup_from_date(State(state.clone()), Path((contract_id, restore_req))).await?;
-    
+
+    let restoration =
+        restore_backup_from_date(State(state.clone()), Path((contract_id, restore_req))).await?;
+
     let duration_seconds = start_time.elapsed().as_secs() as i32;
     let data_loss_seconds = (chrono::Duration::minutes(1)).num_seconds() as i32; // Default to 1 minute
-    
+
     let metrics = RecoveryMetrics {
         rto_achieved_seconds: duration_seconds,
         rpo_ached_seconds: data_loss_seconds,
@@ -287,7 +302,7 @@ pub async fn execute_recovery(
         recovery_duration_seconds: duration_seconds,
         data_loss_seconds,
     };
-    
+
     Ok(Json(metrics))
 }
 
@@ -314,10 +329,12 @@ async fn restore_backup_from_date(
     // Simulate restoration
     let duration_ms = start.elapsed().as_millis() as i32;
 
-    let contract = sqlx::query!("SELECT publisher_id FROM contracts WHERE id = $1", contract_id)
+    let contract = sqlx::query("SELECT publisher_id FROM contracts WHERE id = $1")
+        .bind(contract_id)
         .fetch_one(&state.db)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+    let publisher_id: Uuid = contract.get("publisher_id");
 
     let restoration = sqlx::query_as::<_, BackupRestoration>(
         r#"
@@ -327,7 +344,7 @@ async fn restore_backup_from_date(
         "#,
     )
     .bind(backup.id)
-    .bind(contract.publisher_id)
+    .bind(publisher_id)
     .bind(duration_ms)
     .bind(true)
     .fetch_one(&state.db)

@@ -1,10 +1,11 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,25 +19,135 @@ pub enum Network {
 use std::path::Path;
 
 use crate::patch::{PatchManager, Severity};
-use crate::profiler;
-use crate::sla::SlaManager;
 use crate::test_framework;
+
+pub fn generate_flame_graph_file(
+    profile: &profiler::ProfileData,
+    output_path: &str,
+) -> Result<()> {
+    profiler::generate_flame_graph(profile, Path::new(output_path))
+}
+
+pub fn profile(
+    contract_path: &str,
+    method: Option<&str>,
+    output: Option<&str>,
+    flamegraph: Option<&str>,
+    compare: Option<&str>,
+    show_recommendations: bool,
+) -> Result<()> {
+    println!("\n{}", "Profiling contract execution...".bold().cyan());
+    println!("{}", "=".repeat(80).cyan());
+
+    let profile_data = profiler::profile_contract(contract_path, method)
+        .with_context(|| format!("Failed to profile contract: {}", contract_path))?;
+
+    if let Some(method_name) = method {
+        if profile_data.functions.is_empty() {
+            anyhow::bail!(
+                "Method '{}' was not found in contract: {}",
+                method_name,
+                contract_path
+            );
+        }
+    }
+
+    println!("{}: {}", "Contract".bold(), contract_path);
+    println!(
+        "{}: {:.2}ms",
+        "Total duration".bold(),
+        profile_data.total_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "{}: {}",
+        "Functions profiled".bold(),
+        profile_data.functions.len()
+    );
+
+    if let Some(output_path) = output {
+        let profile_json =
+            serde_json::to_string_pretty(&profile_data).context("Failed to serialize profile data")?;
+        fs::write(output_path, profile_json)
+            .with_context(|| format!("Failed to write profile output: {}", output_path))?;
+        println!("{} Profile output written to {}", "✓".green(), output_path);
+    }
+
+    if let Some(flamegraph_path) = flamegraph {
+        generate_flame_graph_file(&profile_data, flamegraph_path).with_context(|| {
+            format!("Failed to generate flame graph at {}", flamegraph_path)
+        })?;
+        println!("{} Flame graph written to {}", "✓".green(), flamegraph_path);
+    }
+
+    if let Some(baseline_path) = compare {
+        let baseline = profiler::load_baseline(baseline_path)
+            .with_context(|| format!("Failed to load baseline profile from {}", baseline_path))?;
+        let comparisons = profiler::compare_profiles(&baseline, &profile_data);
+
+        println!("\n{}", "Profile comparison:".bold().yellow());
+        if comparisons.is_empty() {
+            println!("No comparable function data found.");
+        } else {
+            for change in comparisons.iter().take(10) {
+                let diff_ms = change.time_diff_ns as f64 / 1_000_000.0;
+                println!(
+                    "  {} [{}] {:+.2}% ({:+.3}ms)",
+                    change.function.bold(),
+                    change.status,
+                    change.time_diff_percent,
+                    diff_ms
+                );
+            }
+            if comparisons.len() > 10 {
+                println!("  ...and {} more", comparisons.len() - 10);
+            }
+        }
+    }
+
+    if show_recommendations {
+        let recommendations = profiler::generate_recommendations(&profile_data);
+        println!("\n{}", "Recommendations:".bold().magenta());
+        for recommendation in recommendations {
+            println!("  - {}", recommendation);
+        }
+    }
+
+    println!("\n{}", "=".repeat(80).cyan());
+    println!();
+
+    Ok(())
+}
 
 pub async fn search(
     api_url: &str,
     query: &str,
     network: Network,
     verified_only: bool,
-	 json: bool,
+    networks: Vec<String>,
+    category: Option<&str>,
+    limit: usize,
+    offset: usize,
+    json: bool,
 ) -> Result<()> {
     let client = reqwest::Client::new();
+
     let mut url = format!(
-        "{}/api/contracts?query={}&network={}",
-        api_url, query, network
+        "{}/api/contracts?query={}&limit={}&offset={}",
+        api_url, query, limit, offset
     );
+
+    if !networks.is_empty() {
+        url.push_str(&format!("&networks={}", networks.join(",")));
+    } else {
+        url.push_str(&format!("&network={}", network));
+    }
 
     if verified_only {
         url.push_str("&verified_only=true");
+    }
+
+    if let Some(cat) = category {
+        url.push_str(&format!("&category={}", cat));
     }
 
     let response = client
@@ -48,37 +159,74 @@ pub async fn search(
     let data: serde_json::Value = response.json().await?;
     let items = data["items"].as_array().context("Invalid response")?;
 
-	 if json {
+    if json {
         let contracts: Vec<serde_json::Value> = items
             .iter()
-            .map(|c| serde_json::json!({
-                "id":          c["contract_id"].as_str().unwrap_or(""),
-                "name":        c["name"].as_str().unwrap_or("Unknown"),
-                "is_verified": c["is_verified"].as_bool().unwrap_or(false),
-                "network":     c["network"].as_str().unwrap_or(""),
-            }))
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "contracts": contracts }))?);
+            .map(|c| -> Result<_> {
+                Ok(serde_json::json!({
+                    "id":          crate::conversions::as_str(&c["contract_id"], "contract_id")?,
+                    "name":        crate::conversions::as_str(&c["name"], "name")?,
+                    "is_verified": crate::conversions::as_bool(&c["is_verified"], "is_verified")?,
+                    "network":     crate::conversions::as_str(&c["network"], "network")?,
+                    "category":    c["category"].as_str().unwrap_or(""),
+                }))
+            })
+            .collect::<Result<_, _>>()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "contracts": contracts }))?
+        );
         return Ok(());
     }
 
     println!("\n{}", "Search Results:".bold().cyan());
     println!("{}", "=".repeat(80).cyan());
 
+    // Show active filters
+    let mut active_filters: Vec<String> = Vec::new();
+    if !networks.is_empty() {
+        active_filters.push(format!("networks: {}", networks.join(", ")));
+    }
+    if let Some(cat) = category {
+        active_filters.push(format!("category: {}", cat));
+    }
+    if verified_only {
+        active_filters.push("verified only".to_string());
+    }
+    if !active_filters.is_empty() {
+        println!(
+            "  {} {}\n",
+            "Active filters:".bold(),
+            active_filters.join(" | ").bright_blue()
+        );
+    }
+
     if items.is_empty() {
-        println!("{}", "No contracts found.".yellow());
+        println!("{}", "No contracts found matching your filters.".yellow());
+        println!("\n{}", "Suggestions:".bold());
+        println!("  • Try a broader search query");
+        if category.is_some() {
+            println!("  • Remove the --category filter to see all contract types");
+        }
+        if !networks.is_empty() {
+            println!("  • Try adding more networks: --networks mainnet,testnet,futurenet");
+        }
+        if verified_only {
+            println!("  • Remove --verified-only to include unverified contracts");
+        }
+        println!("  • Use 'list' command to browse all contracts\n");
         return Ok(());
     }
 
     for contract in items {
-        let name = contract["name"].as_str().unwrap_or("Unknown");
-        let contract_id = contract["contract_id"].as_str().unwrap_or("");
-        let is_verified = contract["is_verified"].as_bool().unwrap_or(false);
-        let network = contract["network"].as_str().unwrap_or("");
+        let name = crate::conversions::as_str(&contract["name"], "name")?;
+        let contract_id = crate::conversions::as_str(&contract["contract_id"], "contract_id")?;
+        let is_verified = crate::conversions::as_bool(&contract["is_verified"], "is_verified")?;
+        let network = crate::conversions::as_str(&contract["network"], "network")?;
 
         println!("\n{} {}", "●".green(), name.bold());
         println!("  ID: {}", contract_id.bright_black());
-        println!(
+        print!(
             "  Status: {} | Network: {}",
             if is_verified {
                 "✓ Verified".green()
@@ -88,13 +236,20 @@ pub async fn search(
             network.bright_blue()
         );
 
+        if let Some(cat) = contract["category"].as_str() {
+            if !cat.is_empty() {
+                print!(" | Category: {}", cat.bright_magenta());
+            }
+        }
+        println!();
+
         if let Some(desc) = contract["description"].as_str() {
             println!("  {}", desc.bright_black());
         }
     }
 
     println!("\n{}", "=".repeat(80).cyan());
-    println!("Found {} contract(s)\n", items.len());
+    println!("Found {} contract(s) (offset: {})\n", items.len(), offset);
 
     Ok(())
 }
@@ -163,7 +318,7 @@ pub async fn upgrade_analyze(api_url: &str, old_id: &str, new_id: &str, json_out
 }
 
 #[cfg(test)]
-mod tests {
+mod upgrade_analyze_tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
@@ -188,6 +343,31 @@ mod tests {
         let res = upgrade_analyze("http://localhost:3001", old_path.to_str().unwrap(), new_path.to_str().unwrap(), true).await;
         assert!(res.is_ok());
     }
+}
+
+@@ -235,50 +235,61 @@ pub async fn list(api_url: &str, limit: usize, network: Network) -> Result<()> {
+        let network = contract["network"].as_str().unwrap_or("");
+        println!(
+            "\n{}. {} {}",
+            i + 1,
+            name.bold(),
+            if is_verified {
+                "✓".green()
+            } else {
+                "".normal()
+            }
+        );
+        println!(
+            "   {} | {}",
+            contract_id.bright_black(),
+            network.bright_blue()
+        );
+    }
+
+    println!("\n{}", "=".repeat(80).cyan());
+    println!();
+
+    Ok(())
 }
 
 impl fmt::Display for Network {
@@ -267,17 +447,17 @@ pub async fn publish(
     println!(
         "\n{}: {}",
         "Name".bold(),
-        contract["name"].as_str().unwrap_or("")
+        crate::conversions::as_str(&contract["name"], "name")?
     );
     println!(
         "{}: {}",
         "ID".bold(),
-        contract["contract_id"].as_str().unwrap_or("")
+        crate::conversions::as_str(&contract["contract_id"], "contract_id")?
     );
     println!(
         "{}: {}",
         "Network".bold(),
-        contract["network"].as_str().unwrap_or("").bright_blue()
+        crate::conversions::as_str(&contract["network"], "network")?.bright_blue()
     );
     println!();
 
@@ -303,13 +483,13 @@ pub async fn list(api_url: &str, limit: usize, network: Network, json: bool,) ->
 	if json {
         let contracts: Vec<serde_json::Value> = items
             .iter()
-            .map(|c| serde_json::json!({
-                "id":          c["contract_id"].as_str().unwrap_or(""),
-                "name":        c["name"].as_str().unwrap_or("Unknown"),
-                "is_verified": c["is_verified"].as_bool().unwrap_or(false),
-                "network":     c["network"].as_str().unwrap_or(""),
-            }))
-            .collect();
+            .map(|c| -> Result<_> { Ok(serde_json::json!({
+                "id":          crate::conversions::as_str(&c["contract_id"], "contract_id")?,
+                "name":        crate::conversions::as_str(&c["name"], "name")?,
+                "is_verified": crate::conversions::as_bool(&c["is_verified"], "is_verified")?,
+                "network":     crate::conversions::as_str(&c["network"], "network")?,
+            })) })
+            .collect::<Result<_, _>>()?;
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "contracts": contracts }))?);
         return Ok(());
     }
@@ -323,10 +503,10 @@ pub async fn list(api_url: &str, limit: usize, network: Network, json: bool,) ->
     }
 
     for (i, contract) in items.iter().enumerate() {
-        let name = contract["name"].as_str().unwrap_or("Unknown");
-        let contract_id = contract["contract_id"].as_str().unwrap_or("");
-        let is_verified = contract["is_verified"].as_bool().unwrap_or(false);
-        let network = contract["network"].as_str().unwrap_or("");
+        let name = crate::conversions::as_str(&contract["name"], "name")?;
+        let contract_id = crate::conversions::as_str(&contract["contract_id"], "contract_id")?;
+        let is_verified = crate::conversions::as_bool(&contract["is_verified"], "is_verified")?;
+        let network = crate::conversions::as_str(&contract["network"], "network")?;
 
         println!(
             "\n{}. {} {}",
@@ -351,6 +531,17 @@ pub async fn list(api_url: &str, limit: usize, network: Network, json: bool,) ->
     Ok(())
 }
 
+fn extract_migration_id(migration: &serde_json::Value) -> Result<String> {
+    let Some(migration_id) = migration["id"].as_str() else {
+        eprintln!(
+            "[error] migration response missing string id field: {}",
+            migration
+        );
+        anyhow::bail!("Invalid migration response: missing id");
+    };
+
+    Ok(migration_id.to_string())
+}
 pub async fn breaking_changes(api_url: &str, old_id: &str, new_id: &str, json: bool) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!(
@@ -376,9 +567,9 @@ pub async fn breaking_changes(api_url: &str, old_id: &str, new_id: &str, json: b
         return Ok(());
     }
 
-    let breaking = report["breaking"].as_bool().unwrap_or(false);
-    let breaking_count = report["breaking_count"].as_u64().unwrap_or(0);
-    let non_breaking_count = report["non_breaking_count"].as_u64().unwrap_or(0);
+    let breaking = crate::conversions::as_bool(&report["breaking"], "breaking")?;
+    let breaking_count = crate::conversions::as_u64(&report["breaking_count"], "breaking_count")?;
+    let non_breaking_count = crate::conversions::as_u64(&report["non_breaking_count"], "non_breaking_count")?;
 
     let header = if breaking {
         "Breaking changes detected".red().bold()
@@ -397,8 +588,8 @@ pub async fn breaking_changes(api_url: &str, old_id: &str, new_id: &str, json: b
 
     if let Some(changes) = report["changes"].as_array() {
         for change in changes {
-            let severity = change["severity"].as_str().unwrap_or("unknown");
-            let message = change["message"].as_str().unwrap_or("Change");
+            let severity = crate::conversions::as_str(&change["severity"], "severity")?;
+            let message = crate::conversions::as_str(&change["message"], "message")?;
             let label = if severity == "breaking" {
                 "BREAKING".red().bold()
             } else {
@@ -436,19 +627,7 @@ pub async fn migrate(
     let wasm_hash = hex::encode(hasher.finalize());
 
     println!("Contract ID: {}", contract_id.green());
-    println!("WASM Path:   {}", wasm_path);
-    println!("WASM Hash:   {}", wasm_hash.bright_black());
-    println!("Size:        {} bytes", wasm_bytes.len());
-
-    if dry_run {
-        println!("\n{}", "[DRY RUN] No changes will be made.".yellow().bold());
-        println!("Would create migration record...");
-        println!(
-            "Would execute: soroban contract invoke --id {} --wasm {} ...",
-            contract_id, wasm_path
-        );
-        return Ok(());
-    }
+@@ -298,51 +309,51 @@ pub async fn migrate(
 
     // 3. Create Migration Record (Pending)
     let client = reqwest::Client::new();
@@ -474,7 +653,8 @@ pub async fn migrate(
     }
 
     let migration: serde_json::Value = response.json().await?;
-    let migration_id = migration["id"].as_str().unwrap();
+    let migration_id = extract_migration_id(&migration)?;
+    let migration_id = crate::conversions::as_str(&migration["id"], "id")?;
     println!("{}", "OK".green());
     println!("Migration ID: {}", migration_id);
 
@@ -500,6 +680,87 @@ pub async fn migrate(
             println!("{}", "Simulating SUCCESS...".green());
             (
                 shared::models::MigrationStatus::Success,
+@@ -626,51 +637,54 @@ pub fn doc(contract_path: &str, output_dir: &str) -> Result<()> {
+    println!("{} Documentation generated at {:?}", "✓".green(), out_path);
+    Ok(())
+}
+
+pub async fn profile(
+    contract_path: &str,
+    method: Option<&str>,
+    output: Option<&str>,
+    flamegraph: Option<&str>,
+    compare: Option<&str>,
+    show_recommendations: bool,
+) -> Result<()> {
+    let path = Path::new(contract_path);
+    if !path.exists() {
+        anyhow::bail!("Contract file not found: {}", contract_path);
+    }
+
+    println!("\n{}", "Profiling contract...".bold().cyan());
+    println!("{}", "=".repeat(80).cyan());
+
+    let mut profiler = profiler::Profiler::new();
+    profiler::simulate_execution(path, method, &mut profiler)?;
+    let profile_data = profiler.finish(contract_path.to_string(), method.map(|s| s.to_string()));
+
+    println!("\n{}", "Profile Results:".bold().green());
+    println!(
+        "Total Duration: {:.2}ms",
+        profile_data.total_duration.as_secs_f64() * 1000.0
+    );
+    println!("Overhead: {:.2}%", profile_data.overhead_percent);
+    println!("Functions Profiled: {}", profile_data.functions.len());
+
+    let mut sorted_functions: Vec<_> = profile_data.functions.values().collect();
+    sorted_functions.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+
+    println!("\n{}", "Top Functions:".bold());
+    for (i, func) in sorted_functions.iter().take(10).enumerate() {
+        println!(
+            "{}. {} - {:.2}ms ({} calls, avg: {:.2}μs)",
+            i + 1,
+            func.name.bold(),
+            func.total_time.as_secs_f64() * 1000.0,
+            func.call_count,
+            func.avg_time.as_secs_f64() * 1_000_000.0
+        );
+    }
+
+    if let Some(output_path) = output {
+        let json = serde_json::to_string_pretty(&profile_data)?;
+        std::fs::write(output_path, json)
+            .with_context(|| format!("Failed to write profile to: {}", output_path))?;
+        println!("\n{} Profile exported to: {}", "✓".green(), output_path);
+    }
+
+@@ -687,202 +701,254 @@ pub async fn profile(
+        let comparisons = profiler::compare_profiles(&baseline, &profile_data);
+
+        println!("\n{}", "Comparison Results:".bold().yellow());
+        for comp in comparisons.iter().take(10) {
+            let sign = if comp.time_diff_ns > 0 { "+" } else { "" };
+            println!(
+                "{}: {} ({}{:.2}%, {:.2}ms → {:.2}ms)",
+                comp.function.bold(),
+                comp.status,
+                sign,
+                comp.time_diff_percent,
+                comp.baseline_time.as_secs_f64() * 1000.0,
+                comp.current_time.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    if show_recommendations {
+        let recommendations = profiler::generate_recommendations(&profile_data);
+        println!("\n{}", "Recommendations:".bold().magenta());
+        for (i, rec) in recommendations.iter().enumerate() {
+            println!("{}. {}", i + 1, rec);
+        }
+    }
+
                 "Simulation: Migration succeeded.".to_string(),
             )
         }
@@ -703,11 +964,11 @@ pub async fn trust_score(api_url: &str, contract_id: &str, network: Network) -> 
     let data: serde_json::Value = resp.json().await.context("Failed to parse trust score response")?;
 
     // ── Header ────────────────────────────────────────────────────────────────
-    let name       = data["contract_name"].as_str().unwrap_or("Unknown");
-    let score      = data["score"].as_f64().unwrap_or(0.0);
-    let badge      = data["badge"].as_str().unwrap_or("Bronze");
-    let badge_icon = data["badge_icon"].as_str().unwrap_or("🥉");
-    let summary    = data["summary"].as_str().unwrap_or("");
+    let name       = crate::conversions::as_str(&data["contract_name"], "contract_name")?;
+    let score      = crate::conversions::as_f64(&data["score"], "score")?;
+    let badge      = crate::conversions::as_str(&data["badge"], "badge")?;
+    let badge_icon = crate::conversions::as_str(&data["badge_icon"], "badge_icon")?;
+    let summary    = crate::conversions::as_str(&data["summary"], "summary")?;
 
     println!("\n{}", "─".repeat(56));
     println!("  Trust Score — {}", name.bold());
@@ -722,10 +983,10 @@ pub async fn trust_score(api_url: &str, contract_id: &str, network: Network) -> 
 
     if let Some(factors) = data["factors"].as_array() {
         for factor in factors {
-            let fname   = factor["name"].as_str().unwrap_or("");
-            let earned  = factor["points_earned"].as_f64().unwrap_or(0.0);
-            let max     = factor["points_max"].as_f64().unwrap_or(0.0);
-            let explain = factor["explanation"].as_str().unwrap_or("");
+            let fname   = crate::conversions::as_str(&factor["name"], "name")?;
+            let earned  = crate::conversions::as_f64(&factor["points_earned"], "points_earned")?;
+            let max     = crate::conversions::as_f64(&factor["points_max"], "points_max")?;
+            let explain = crate::conversions::as_str(&factor["explanation"], "explanation")?;
 
             // Mini progress bar (10 chars)
             let filled = ((earned / max) * 10.0).round() as usize;
@@ -739,13 +1000,14 @@ pub async fn trust_score(api_url: &str, contract_id: &str, network: Network) -> 
 
     // ── Weight documentation ──────────────────────────────────────────────────
     println!("\n  {} Score Weights\n", "⚖️".bold());
-    if let Some(weights) = data["weights"].as_object() {
+    if let Ok(weights) = crate::conversions::as_object(&data["weights"], "weights") {
         for (k, v) in weights {
-            println!("  {:<22} {:.0} pts max", k, v.as_f64().unwrap_or(0.0));
+            let max_pts = crate::conversions::as_f64(v, "weight_value")?;
+            println!("  {:<22} {:.0} pts max", k, max_pts);
         }
     }
 
-    let computed_at = data["computed_at"].as_str().unwrap_or("");
+    let computed_at = crate::conversions::as_str(&data["computed_at"], "computed_at")?;
     println!("\n  Computed at: {}\n", computed_at.dimmed());
 
     Ok(())
@@ -770,9 +1032,9 @@ pub async fn patch_notify(api_url: &str, patch_id: &str) -> Result<()> {
     }
 
     for (i, c) in contracts.iter().enumerate() {
-        let cid = c["contract_id"].as_str().unwrap_or("");
-        let name = c["name"].as_str().unwrap_or("Unknown");
-        let net = c["network"].as_str().unwrap_or("");
+        let cid = crate::conversions::as_str(&c["contract_id"], "contract_id")?;
+        let name = crate::conversions::as_str(&c["name"], "name")?;
+        let net = crate::conversions::as_str(&c["network"], "network")?;
         println!(
             "  {}. {} ({}) [{}]",
             i + 1,
@@ -813,7 +1075,7 @@ pub async fn deps_list(api_url: &str, contract_id: &str) -> Result<()> {
 
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-             anyhow::bail!("Contract not found");
+            anyhow::bail!("Contract not found");
         }
         anyhow::bail!("Failed to fetch dependencies: {}", response.status());
     }
@@ -829,35 +1091,52 @@ pub async fn deps_list(api_url: &str, contract_id: &str) -> Result<()> {
         return Ok(());
     }
 
-    fn print_tree(nodes: &[serde_json::Value], prefix: &str, is_last: bool) {
+    fn print_tree(nodes: &[serde_json::Value], prefix: &str, is_last: bool) -> Result<()> {
         for (i, node) in nodes.iter().enumerate() {
             let name = node["name"].as_str().unwrap_or("Unknown");
             let constraint = node["constraint_to_parent"].as_str().unwrap_or("*");
             let contract_id = node["contract_id"].as_str().unwrap_or("");
+
+            let name = crate::conversions::as_str(&node["name"], "name")?;
+            let constraint = crate::conversions::as_str(&node["constraint_to_parent"], "constraint_to_parent")?;
+            let contract_id = crate::conversions::as_str(&node["contract_id"], "contract_id")?;
             
             let is_node_last = i == nodes.len() - 1;
-            let marker = if is_node_last { "└──" } else { "├──" };
-            
+            let marker = if is_node_last {
+                "└──"
+            } else {
+                "├──"
+            };
+
             println!(
-                "{}{} {} ({}) {}", 
-                prefix, 
-                marker.bright_black(), 
-                name.bold(), 
+                "{}{} {} ({}) {}",
+                prefix,
+                marker.bright_black(),
+                name.bold(),
                 constraint.cyan(),
-                if contract_id == "unknown" { "[Unresolved]".red() } else { "".normal() }
+                if contract_id == "unknown" {
+                    "[Unresolved]".red()
+                } else {
+                    "".normal()
+                }
             );
 
             if let Some(children) = node["dependencies"].as_array() {
                 if !children.is_empty() {
+                    let new_prefix =
+                        format!("{}{}", prefix, if is_node_last { "    " } else { "│   " });
+                    print_tree(children, &new_prefix, true);
                      let new_prefix = format!("{}{}", prefix, if is_node_last { "    " } else { "│   " });
-                     print_tree(children, &new_prefix, true);
+                     print_tree(children, &new_prefix, true)?;
                 }
             }
         }
+        Ok(())
     }
 
-    print_tree(tree, "", false);
+    print_tree(tree, "", false)?;
 
+    println!("\n{}", "=".repeat(80).cyan());
     println!();
     Ok(())
 }
@@ -881,7 +1160,7 @@ pub async fn run_tests(
     println!("{}", "=".repeat(80).cyan());
 
     let scenario = test_framework::load_test_scenario(test_path)?;
-    
+
     if verbose {
         println!("\n{}: {}", "Scenario".bold(), scenario.name);
         if let Some(desc) = &scenario.description {
@@ -898,7 +1177,7 @@ pub async fn run_tests(
     println!("{}", "=".repeat(80).cyan());
 
     let status_icon = if result.passed { "✓" } else { "✗" };
-    
+
     println!(
         "\n{} {} {} ({:.2}ms)",
         status_icon,
@@ -916,7 +1195,7 @@ pub async fn run_tests(
     println!("\n{}", "Step Results:".bold());
     for (i, step) in result.steps.iter().enumerate() {
         let step_icon = if step.passed { "✓" } else { "✗" };
-        
+
         println!(
             "  {}. {} {} ({:.2}ms)",
             i + 1,
@@ -941,25 +1220,32 @@ pub async fn run_tests(
     if show_coverage {
         println!("\n{}", "Coverage Report:".bold().magenta());
         println!("  Contracts Tested: {}", result.coverage.contracts_tested);
-        println!("  Methods Tested: {}/{}", 
-            result.coverage.methods_tested, 
-            result.coverage.total_methods
+        println!(
+            "  Methods Tested: {}/{}",
+            result.coverage.methods_tested, result.coverage.total_methods
         );
         println!("  Coverage: {:.2}%", result.coverage.coverage_percent);
-        
+
         if result.coverage.coverage_percent < 80.0 {
             println!("  {} Low coverage detected!", "⚠".yellow());
         }
     }
 
     if let Some(junit_path) = junit_output {
+        test_framework::generate_junit_xml(&[result], Path::new(junit_path))?;
+        println!(
+            "\n{} JUnit XML report exported to: {}",
+            "✓".green(),
+            junit_path
+        );
         test_framework::generate_junit_xml(&[result.clone()], Path::new(junit_path))?;
         println!("\n{} JUnit XML report exported to: {}", "✓".green(), junit_path);
     }
 
     if total_time.as_secs() > 5 {
-        println!("\n{} Test execution took {:.2}s (target: <5s)", 
-            "⚠".yellow(), 
+        println!(
+            "\n{} Test execution took {:.2}s (target: <5s)",
+            "⚠".yellow(),
             total_time.as_secs_f64()
         );
     }
@@ -974,6 +1260,43 @@ pub async fn run_tests(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::extract_migration_id;
+    use serde_json::json;
+
+    #[test]
+    fn extract_migration_id_returns_id_for_valid_payload() {
+        let payload = json!({"id": "migration-123"});
+        let migration_id = extract_migration_id(&payload);
+        assert!(migration_id.is_ok());
+        assert_eq!(migration_id.unwrap_or_default(), "migration-123");
+    }
+
+    #[test]
+    fn extract_migration_id_fails_when_missing_id() {
+        let payload = json!({"status": "pending"});
+        let err = extract_migration_id(&payload);
+        assert!(err.is_err());
+        assert!(err
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .contains("Invalid migration response: missing id"));
+    }
+
+    #[test]
+    fn extract_migration_id_fails_when_id_is_not_string() {
+        let payload = json!({"id": 99});
+        let err = extract_migration_id(&payload);
+        assert!(err.is_err());
+        assert!(err
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .contains("Invalid migration response: missing id"));
+    }
+}
 pub fn incident_trigger(contract_id: &str, severity_str: &str) -> Result<()> {
     use crate::incident::{IncidentManager, IncidentSeverity};
 
@@ -1030,9 +1353,9 @@ pub async fn config_get(api_url: &str, contract_id: &str, environment: &str) -> 
     println!("{}", "=".repeat(80).cyan());
     println!("{}: {}", "Contract ID".bold(), contract_id);
     println!("{}: {}", "Environment".bold(), environment);
-    println!("{}: {}", "Version".bold(), config["version"].as_i64().unwrap_or(0));
-    println!("{}: {}", "Contains Secrets".bold(), config["has_secrets"].as_bool().unwrap_or(false));
-    println!("{}: {}", "Created By".bold(), config["created_by"].as_str().unwrap_or("Unknown"));
+    println!("{}: {}", "Version".bold(), crate::conversions::as_i64(&config["version"], "version")?);
+    println!("{}: {}", "Contains Secrets".bold(), crate::conversions::as_bool(&config["has_secrets"], "has_secrets")?);
+    println!("{}: {}", "Created By".bold(), crate::conversions::as_str(&config["created_by"], "created_by")?);
     println!("{}:", "Config Data".bold());
     println!("{}", serde_json::to_string_pretty(&config["config_data"]).unwrap_or_default().green());
     println!();
@@ -1074,7 +1397,7 @@ pub async fn config_set(
 
     println!("{}", "✓ Configuration published successfully!".green().bold());
     println!("  {}: {}", "Environment".bold(), environment);
-    println!("  {}: {}", "New Version".bold(), config["version"].as_i64().unwrap_or(0));
+    println!("  {}: {}", "New Version".bold(), crate::conversions::as_i64(&config["version"], "version")?);
     println!();
 
     Ok(())
@@ -1104,9 +1427,9 @@ pub async fn config_history(api_url: &str, contract_id: &str, environment: &str)
         println!(
             "  {}. {} (v{}) - By: {}",
             i + 1,
-            config["created_at"].as_str().unwrap_or("Unknown Date").bright_black(),
-            config["version"].as_i64().unwrap_or(0),
-            config["created_by"].as_str().unwrap_or("Unknown").bright_blue()
+            crate::conversions::as_str(&config["created_at"], "created_at")?.bright_black(),
+            crate::conversions::as_i64(&config["version"], "version")?,
+            crate::conversions::as_str(&config["created_by"], "created_by")?.bright_blue()
         );
     }
     println!();
@@ -1141,7 +1464,7 @@ pub async fn config_rollback(
 
     println!("{}", "✓ Configuration rolled back successfully!".green().bold());
     println!("  {}: {}", "Environment".bold(), environment);
-    println!("  {}: {}", "New Active Version".bold(), config["version"].as_i64().unwrap_or(0));
+    println!("  {}: {}", "New Active Version".bold(), crate::conversions::as_i64(&config["version"], "version")?);
     println!();
 
     Ok(())
@@ -1216,7 +1539,7 @@ pub async fn scan_deps(
     }
 
     let report: serde_json::Value = response.json().await?;
-    let findings = report["findings"].as_array().unwrap();
+    let findings = crate::conversions::as_array(&report["findings"], "findings")?;
 
     if findings.is_empty() {
         println!("{}", "✓ No vulnerabilities found!".green().bold());
@@ -1228,13 +1551,13 @@ pub async fn scan_deps(
     println!("{}", "=".repeat(80).red());
 
     for finding in findings {
-        let package = finding["package_name"].as_str().unwrap_or("Unknown");
-        let version = finding["current_version"].as_str().unwrap_or("Unknown");
-        let severity = finding["severity"].as_str().unwrap_or("Unknown");
-        let cve_id = finding["cve_id"].as_str().unwrap_or("Unknown");
-        let recommended = finding["recommended_version"].as_str().unwrap_or("None");
+        let package = crate::conversions::as_str(&finding["package_name"], "package_name")?;
+        let version = crate::conversions::as_str(&finding["current_version"], "current_version")?;
+        let severity = crate::conversions::as_str(&finding["severity"], "severity")?;
+        let cve_id = crate::conversions::as_str(&finding["cve_id"], "cve_id")?;
+        let recommended = crate::conversions::as_str(&finding["recommended_version"], "recommended_version")?;
 
-        let sev_enum = severity.parse::<Severity>().unwrap_or(Severity::Low);
+        let sev_enum = severity.parse::<Severity>().context("Invalid severity string")?;
         if matches!(sev_enum, Severity::Critical | Severity::High) {
             has_high_severity = true;
         }
@@ -1254,10 +1577,48 @@ pub async fn scan_deps(
 }
 
 #[cfg(test)]
-mod tests {
+mod flamegraph_and_network_tests {
+mod tests_network {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::Duration;
+
+    fn sample_profile() -> profiler::ProfileData {
+        let mut functions = HashMap::new();
+        functions.insert(
+            "main".to_string(),
+            profiler::FunctionProfile {
+                name: "main".to_string(),
+                total_time: Duration::from_millis(10),
+                call_count: 1,
+                avg_time: Duration::from_millis(10),
+                min_time: Duration::from_millis(10),
+                max_time: Duration::from_millis(10),
+                children: vec![],
+            },
+        );
+
+        profiler::ProfileData {
+            contract_path: "contract.rs".to_string(),
+            method: Some("main".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            total_duration: Duration::from_millis(10),
+            functions,
+            call_stack: vec![],
+            overhead_percent: 0.0,
+        }
+    }
+
+    fn write_sample_contract(temp_dir: &tempfile::TempDir) -> String {
+        let contract_path = temp_dir.path().join("sample_contract.rs");
+        fs::write(
+            &contract_path,
+            "pub fn main() {}\nfn helper_one() {}\nfn helper_two() {}\n",
+        )
+        .expect("failed to write sample contract");
+        contract_path.to_string_lossy().into_owned()
+    }
 
     #[test]
     fn test_network_parsing() {
@@ -1268,9 +1629,124 @@ mod tests {
         assert!("invalid".parse::<Network>().is_err());
     }
 
-    // Note: Integration tests involving file system would require mocking or temporary files.
-    // Given the constraints and the environment, we focus on unit tests for parsing here.
-    // `resolve_network` with file interaction is harder to test in isolation without dependency injection or mocking `dirs` / `fs`.
+    #[test]
+    fn generate_flame_graph_file_writes_svg_for_valid_path() {
+        let profile = sample_profile();
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let output_path = temp_dir.path().join("flamegraph-output.svg");
+        let output_path_str = output_path.to_string_lossy().into_owned();
+
+        generate_flame_graph_file(&profile, &output_path_str)
+            .expect("expected flame graph generation to succeed");
+        assert!(output_path.exists(), "expected output file to exist");
+    }
+
+    #[test]
+    fn generate_flame_graph_file_returns_error_for_invalid_path() {
+        let profile = sample_profile();
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let invalid_output = temp_dir.path().join("missing-dir").join("flamegraph-output.svg");
+        let invalid_output_str = invalid_output.to_string_lossy().into_owned();
+
+        let err = generate_flame_graph_file(&profile, &invalid_output_str)
+            .expect_err("expected flame graph generation to fail for invalid path");
+        assert!(
+            err.to_string().contains("Failed to write flame graph"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_writes_json_and_flamegraph_outputs() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let contract_path = write_sample_contract(&temp_dir);
+        let json_output = temp_dir.path().join("profile-output.json");
+        let flame_output = temp_dir.path().join("profile-output.svg");
+        let json_output_str = json_output.to_string_lossy().into_owned();
+        let flame_output_str = flame_output.to_string_lossy().into_owned();
+
+        profile(
+            &contract_path,
+            None,
+            Some(&json_output_str),
+            Some(&flame_output_str),
+            None,
+            true,
+        )
+        .expect("expected profiling to succeed");
+
+        assert!(json_output.exists(), "expected JSON profile output to exist");
+        assert!(
+            flame_output.exists(),
+            "expected flame graph output to exist"
+        );
+    }
+
+    #[test]
+    fn profile_supports_baseline_comparison() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let contract_path = write_sample_contract(&temp_dir);
+        let baseline_path = temp_dir.path().join("baseline.json");
+        let baseline_path_str = baseline_path.to_string_lossy().into_owned();
+
+        let baseline_json =
+            serde_json::to_string_pretty(&sample_profile()).expect("failed to serialize baseline");
+        fs::write(&baseline_path, baseline_json).expect("failed to write baseline file");
+
+        profile(
+            &contract_path,
+            None,
+            None,
+            None,
+            Some(&baseline_path_str),
+            false,
+        )
+        .expect("expected profiling with baseline comparison to succeed");
+    }
+
+    #[test]
+    fn profile_returns_error_for_missing_baseline() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let contract_path = write_sample_contract(&temp_dir);
+        let missing_baseline = temp_dir.path().join("missing-baseline.json");
+        let missing_baseline_str = missing_baseline.to_string_lossy().into_owned();
+
+        let err = profile(
+            &contract_path,
+            None,
+            None,
+            None,
+            Some(&missing_baseline_str),
+            false,
+        )
+        .expect_err("expected missing baseline to fail");
+
+        assert!(
+            err.to_string().contains("Failed to load baseline profile from"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_returns_error_for_unknown_method() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let contract_path = write_sample_contract(&temp_dir);
+
+        let err = profile(
+            &contract_path,
+            Some("does_not_exist"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("expected unknown method to fail");
+
+        assert!(
+            err.to_string().contains("was not found in contract"),
+            "unexpected error: {err}"
+        );
+    }
 }
 /// Validate a contract function call for type safety
 pub async fn validate_call(
@@ -1302,12 +1778,12 @@ pub async fn validate_call(
     let data: serde_json::Value = response.json().await?;
 
     if !status.is_success() {
-        let error_msg = data["message"].as_str().unwrap_or("Unknown error");
+        let error_msg = crate::conversions::as_str(&data["message"], "message")?;
         println!("\n{} {}", "Error:".bold().red(), error_msg);
         anyhow::bail!("Validation failed: {}", error_msg);
     }
 
-    let valid = data["valid"].as_bool().unwrap_or(false);
+    let valid = crate::conversions::as_bool(&data["valid"], "valid")?;
 
     println!("\n{}", "Contract Call Validation".bold().cyan());
     println!("{}", "=".repeat(60).cyan());
@@ -1322,8 +1798,8 @@ pub async fn validate_call(
         if let Some(params) = data["parsed_params"].as_array() {
             println!("\n{}", "Parsed Parameters:".bold());
             for param in params {
-                let name = param["name"].as_str().unwrap_or("?");
-                let type_name = param["expected_type"].as_str().unwrap_or("?");
+                let name = crate::conversions::as_str(&param["name"], "name")?;
+                let type_name = crate::conversions::as_str(&param["expected_type"], "expected_type")?;
                 println!("  {} {}: {}", "•".green(), name.bold(), type_name);
             }
         }
@@ -1338,7 +1814,7 @@ pub async fn validate_call(
             if !warnings.is_empty() {
                 println!("\n{}", "Warnings:".bold().yellow());
                 for warning in warnings {
-                    let msg = warning["message"].as_str().unwrap_or("?");
+                    let msg = crate::conversions::as_str(&warning["message"], "message")?;
                     println!("  {} {}", "⚠".yellow(), msg);
                 }
             }
@@ -1350,8 +1826,8 @@ pub async fn validate_call(
         if let Some(errors) = data["errors"].as_array() {
             println!("\n{}", "Errors:".bold().red());
             for error in errors {
-                let code = error["code"].as_str().unwrap_or("?");
-                let msg = error["message"].as_str().unwrap_or("?");
+                let code = crate::conversions::as_str(&error["code"], "code")?;
+                let msg = crate::conversions::as_str(&error["message"], "message")?;
                 let field = error["field"].as_str();
 
                 if let Some(f) = field {
@@ -1405,7 +1881,7 @@ pub async fn generate_bindings(
 
     if !status.is_success() {
         let error: serde_json::Value = response.json().await?;
-        let msg = error["message"].as_str().unwrap_or("Unknown error");
+        let msg = crate::conversions::as_str(&error["message"], "message")?;
         anyhow::bail!("Failed to generate bindings: {}", msg);
     }
 
@@ -1444,11 +1920,11 @@ pub async fn list_functions(api_url: &str, contract_id: &str) -> Result<()> {
     let data: serde_json::Value = response.json().await?;
 
     if !status.is_success() {
-        let msg = data["message"].as_str().unwrap_or("Unknown error");
+        let msg = crate::conversions::as_str(&data["message"], "message")?;
         anyhow::bail!("Failed to list functions: {}", msg);
     }
 
-    let contract_name = data["contract_name"].as_str().unwrap_or("Unknown");
+    let contract_name = crate::conversions::as_str(&data["contract_name"], "contract_name")?;
     let functions = data["functions"].as_array();
 
     println!("\n{}", "Contract Functions".bold().cyan());
@@ -1460,10 +1936,10 @@ pub async fn list_functions(api_url: &str, contract_id: &str) -> Result<()> {
         println!("\n{} {} function(s):\n", "Found".bold(), funcs.len());
 
         for func in funcs {
-            let name = func["name"].as_str().unwrap_or("?");
-            let visibility = func["visibility"].as_str().unwrap_or("?");
-            let return_type = func["return_type"].as_str().unwrap_or("void");
-            let is_mutable = func["is_mutable"].as_bool().unwrap_or(false);
+            let name = crate::conversions::as_str(&func["name"], "name")?;
+            let visibility = crate::conversions::as_str(&func["visibility"], "visibility")?;
+            let return_type = crate::conversions::as_str(&func["return_type"], "return_type")?;
+            let is_mutable = crate::conversions::as_bool(&func["is_mutable"], "is_mutable")?;
 
             let visibility_badge = if visibility == "public" {
                 "public".green()
@@ -1487,14 +1963,12 @@ pub async fn list_functions(api_url: &str, contract_id: &str) -> Result<()> {
 
             // Parameters
             if let Some(params) = func["params"].as_array() {
-                let param_strs: Vec<String> = params
-                    .iter()
-                    .map(|p| {
-                        let pname = p["name"].as_str().unwrap_or("?");
-                        let ptype = p["type_name"].as_str().unwrap_or("?");
-                        format!("{}: {}", pname, ptype)
-                    })
-                    .collect();
+                let mut param_strs: Vec<String> = Vec::new();
+                for p in params {
+                    let pname = crate::conversions::as_str(&p["name"], "name")?;
+                    let ptype = crate::conversions::as_str(&p["type_name"], "type_name")?;
+                    param_strs.push(format!("{}: {}", pname, ptype));
+                }
 
                 println!("     ({}) -> {}", param_strs.join(", "), return_type);
             }
