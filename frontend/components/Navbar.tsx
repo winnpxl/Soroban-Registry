@@ -1,6 +1,6 @@
 'use client';
 
-import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus } from 'lucide-react';
+import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus, Columns2 } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useState, useRef } from 'react';
@@ -10,7 +10,7 @@ export default function Navbar() {
     const [isDropdownOpen, setIsDropdownOpen] = useState(false);
     const [menuOpenForPath, setMenuOpenForPath] = useState<string | null>(null);
     const dropdownTimeout = useRef<NodeJS.Timeout | null>(null);
-    const pathname = usePathname();
+    const pathname = usePathname() ?? '';
 
     // Derive mobileMenuOpen: auto-closes when pathname changes
     const mobileMenuOpen = menuOpenForPath === pathname;
@@ -53,6 +53,17 @@ export default function Navbar() {
                             }`}
                         >
                             Browse
+                        </Link>
+                        <Link
+                            href="/compare"
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-all ${
+                                isActive('/compare')
+                                    ? 'text-primary bg-primary/10'
+                                    : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                            }`}
+                        >
+                            <Columns2 className="w-3 h-3" />
+                            Compare
                         </Link>
 
                         {/* Explore Dropdown */}
@@ -164,6 +175,7 @@ export default function Navbar() {
                         <div className="flex flex-col gap-0.5">
                             {[
                                 { href: '/contracts', label: 'Browse Contracts', icon: Search },
+                                { href: '/compare', label: 'Compare Contracts', icon: Columns2 },
                                 { href: '/publishers', label: 'Publishers', icon: Users },
                                 { href: '/stats', label: 'Statistics', icon: BarChart2 },
                                 { href: '/templates', label: 'Templates', icon: Layers },
