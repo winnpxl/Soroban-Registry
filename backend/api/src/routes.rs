@@ -4,8 +4,9 @@ use crate::{
     ab_test_handlers, auth, auth_handlers, batch_verify_handlers, breaking_changes,
     canary_handlers, category_handlers, compatibility_testing_handlers, custom_metrics_handlers,
     deprecation_handlers, handlers, metrics_handler, migration_handlers, performance_handlers,
-    resource_handlers, simulation_handlers, state::AppState,
+    resource_handlers, simulation_handlers, state::AppState, state::AppState, websocket
 };
+
 use axum::{
     middleware,
     routing::{get, patch, post, put},
@@ -369,7 +370,7 @@ pub fn admin_routes() -> Router<AppState> {
         .route_layer(middleware::from_fn(auth::require_admin))
 }
 
-/// Public read-only category endpoints (no authentication required).
-pub fn category_routes() -> Router<AppState> {
-    Router::new().route("/api/categories", get(category_handlers::list_categories))
+pub fn websocket_routes() -> Router<AppState> {
+    Router::new()
+        .route("/ws/contracts", axum::routing::get(websocket::websocket_handler))
 }
