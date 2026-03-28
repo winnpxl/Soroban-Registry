@@ -19,6 +19,7 @@ pub enum Network {
 use std::path::Path;
 
 use crate::patch::{PatchManager, Severity};
+use crate::profiler;
 use crate::test_framework;
 
 pub fn generate_flame_graph_file(
@@ -129,6 +130,7 @@ pub async fn search(
     offset: usize,
     json: bool,
 ) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let client = reqwest::Client::new();
 
     let mut url = format!(
@@ -163,12 +165,14 @@ pub async fn search(
         let contracts: Vec<serde_json::Value> = items
             .iter()
             .map(|c| -> Result<_> {
+                let contract_id = crate::conversions::as_str(&c["contract_id"], "contract_id")?;
                 Ok(serde_json::json!({
-                    "id":          crate::conversions::as_str(&c["contract_id"], "contract_id")?,
+                    "id":          contract_id.clone(),
                     "name":        crate::conversions::as_str(&c["name"], "name")?,
                     "is_verified": crate::conversions::as_bool(&c["is_verified"], "is_verified")?,
                     "network":     crate::conversions::as_str(&c["network"], "network")?,
                     "category":    c["category"].as_str().unwrap_or(""),
+                    "links": { "detail": format!("{}/contracts/{}", api_url, contract_id) },
                 }))
             })
             .collect::<Result<_, _>>()?;
@@ -182,10 +186,9 @@ pub async fn search(
     println!("\n{}", "Search Results:".bold().cyan());
     println!("{}", "=".repeat(80).cyan());
 
-    // Show active filters
     let mut active_filters: Vec<String> = Vec::new();
     if !networks.is_empty() {
-        active_filters.push(format!("networks: {}", networks.join(", ")));
+        active_filters.push(format!("network: {}", networks.join(", ")));
     }
     if let Some(cat) = category {
         active_filters.push(format!("category: {}", cat));
@@ -209,7 +212,7 @@ pub async fn search(
             println!("  • Remove the --category filter to see all contract types");
         }
         if !networks.is_empty() {
-            println!("  • Try adding more networks: --networks mainnet,testnet,futurenet");
+            println!("  • Try adding more networks: --network mainnet,testnet,futurenet");
         }
         if verified_only {
             println!("  • Remove --verified-only to include unverified contracts");
@@ -218,38 +221,75 @@ pub async fn search(
         return Ok(());
     }
 
+    // Compute visible column widths from raw data (before applying ANSI codes).
+    let name_w = items
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Name".len());
+    let net_w = items
+        .iter()
+        .filter_map(|c| c["network"].as_str())
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Network".len());
+    let cat_w = items
+        .iter()
+        .filter_map(|c| c["category"].as_str().filter(|s| !s.is_empty()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Category".len());
+    // "○ Unverified" is the longest possible verified cell value (12 visible chars).
+    let ver_w = "○ Unverified".chars().count();
+    let link_prefix = format!("{}/contracts/", api_url);
+    let link_w = items
+        .iter()
+        .filter_map(|c| c["contract_id"].as_str())
+        .map(|id| link_prefix.len() + id.len())
+        .max()
+        .unwrap_or(0)
+        .max("Links".len())
+        .min(60);
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for contract in items {
         let name = crate::conversions::as_str(&contract["name"], "name")?;
         let contract_id = crate::conversions::as_str(&contract["contract_id"], "contract_id")?;
         let is_verified = crate::conversions::as_bool(&contract["is_verified"], "is_verified")?;
-        let network = crate::conversions::as_str(&contract["network"], "network")?;
+        let net = crate::conversions::as_str(&contract["network"], "network")?;
+        let cat = contract["category"].as_str().unwrap_or("").to_string();
+        let link = format!("{}/contracts/{}", api_url, contract_id);
 
-        println!("\n{} {}", "●".green(), name.bold());
-        println!("  ID: {}", contract_id.bright_black());
-        print!(
-            "  Status: {} | Network: {}",
-            if is_verified {
-                "✓ Verified".green()
-            } else {
-                "○ Unverified".yellow()
-            },
-            network.bright_blue()
-        );
+        let name_cell = crate::table_format::highlight_match(&name, query);
+        let net_cell = net.bright_blue().to_string();
+        let cat_display = if cat.is_empty() { "—".to_string() } else { cat };
+        let cat_cell = crate::table_format::highlight_match(&cat_display, query);
+        let ver_cell = if is_verified {
+            "✓ Verified".green().to_string()
+        } else {
+            "○ Unverified".yellow().to_string()
+        };
+        let link_cell = link.bright_black().to_string();
 
-        if let Some(cat) = contract["category"].as_str() {
-            if !cat.is_empty() {
-                print!(" | Category: {}", cat.bright_magenta());
-            }
-        }
-        println!();
-
-        if let Some(desc) = contract["description"].as_str() {
-            println!("  {}", desc.bright_black());
-        }
+        rows.push(vec![name_cell, net_cell, cat_cell, ver_cell, link_cell]);
     }
 
-    println!("\n{}", "=".repeat(80).cyan());
-    println!("Found {} contract(s) (offset: {})\n", items.len(), offset);
+    let col_widths = [name_w, net_w, cat_w, ver_w, link_w];
+    let headers = ["Name", "Network", "Category", "Verified", "Links"];
+    print!("{}", crate::table_format::render_table(&headers, &col_widths, &rows));
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    println!(
+        "\n{} {} result(s) for \"{}\"  |  {}ms\n",
+        "→".cyan(),
+        items.len(),
+        query.bold(),
+        elapsed_ms
+    );
 
     Ok(())
 }
@@ -343,31 +383,6 @@ mod upgrade_analyze_tests {
         let res = upgrade_analyze("http://localhost:3001", old_path.to_str().unwrap(), new_path.to_str().unwrap(), true).await;
         assert!(res.is_ok());
     }
-}
-
-@@ -235,50 +235,61 @@ pub async fn list(api_url: &str, limit: usize, network: Network) -> Result<()> {
-        let network = contract["network"].as_str().unwrap_or("");
-        println!(
-            "\n{}. {} {}",
-            i + 1,
-            name.bold(),
-            if is_verified {
-                "✓".green()
-            } else {
-                "".normal()
-            }
-        );
-        println!(
-            "   {} | {}",
-            contract_id.bright_black(),
-            network.bright_blue()
-        );
-    }
-
-    println!("\n{}", "=".repeat(80).cyan());
-    println!();
-
-    Ok(())
 }
 
 impl fmt::Display for Network {
@@ -688,8 +703,6 @@ pub async fn migrate(
             )
         }
     } else {
-        // Real execution would go here. For now we will just mock it even if soroban exists
-        // because we don't have a real contract to invoke in this environment.
         println!(
             "{}",
             "Soroban CLI found, but full integration is pending. Running in MOCK mode.".yellow()
@@ -1154,6 +1167,7 @@ pub async fn run_tests(
         }
     }
 
+    let passed = result.passed;
     if let Some(junit_path) = junit_output {
         test_framework::generate_junit_xml(&[result], Path::new(junit_path))?;
         println!(
@@ -1161,8 +1175,6 @@ pub async fn run_tests(
             "✓".green(),
             junit_path
         );
-        test_framework::generate_junit_xml(&[result.clone()], Path::new(junit_path))?;
-        println!("\n{} JUnit XML report exported to: {}", "✓".green(), junit_path);
     }
 
     if total_time.as_secs() > 5 {
@@ -1176,7 +1188,7 @@ pub async fn run_tests(
     println!("\n{}", "=".repeat(80).cyan());
     println!();
 
-    if !result.passed {
+    if !passed {
         anyhow::bail!("Tests failed");
     }
 
@@ -1670,6 +1682,7 @@ mod tests_network {
             "unexpected error: {err}"
         );
     }
+}
 }
 /// Validate a contract function call for type safety
 pub async fn validate_call(

@@ -36,7 +36,7 @@ fn make_large_profile(n: usize) -> ProfileData {
 }
 
 fn main() {
-    let profile = make_large_profile(50_000); // large profile
+    let profile = make_large_profile(50_000);
     let mut sys = System::new_all();
     sys.refresh_processes();
     let pid = sysinfo::get_current_pid().expect("pid");
@@ -48,7 +48,6 @@ fn main() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         generate_flame_graph(&profile, &path).unwrap();
-        // touch the file to force write
         let _ = fs::read_to_string(&path).unwrap();
         sys.refresh_process(pid);
         let after = sys.process(pid).map(|p| p.memory()).unwrap_or(0);

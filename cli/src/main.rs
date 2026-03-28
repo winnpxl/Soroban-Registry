@@ -24,6 +24,7 @@ mod profiler;
 mod sla;
 mod test_framework;
 mod webhook;
+mod table_format;
 mod wizard;
 
 use anyhow::Result;
@@ -65,7 +66,7 @@ pub enum Commands {
         verified_only: bool,
         /// Filter by one or more networks (comma-separated: mainnet,testnet,futurenet)
         #[arg(long)]
-        networks: Option<String>,
+        network: Option<String>,
         /// Filter by contract category (e.g. DEX, token, lending, oracle)
         #[arg(long)]
         category: Option<String>,
@@ -922,13 +923,13 @@ async fn main() -> Result<()> {
         Commands::Search {
             query,
             verified_only,
-            networks,
+            network: filter_networks,
             category,
             limit,
             offset,
             json,
         } => {
-            let networks_vec: Vec<String> = networks
+            let networks_vec: Vec<String> = filter_networks
                 .map(|n| n.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
             log::debug!(
