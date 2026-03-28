@@ -22,7 +22,9 @@ mod error;
 mod events;
 mod handlers;
 mod dependency_handlers;
-
+mod multisig_handlers;
+mod multisig_routes;
+mod models;
 mod health;
 pub mod health_monitor;
 #[cfg(test)]
