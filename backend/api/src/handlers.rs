@@ -1314,6 +1314,7 @@ pub async fn list_contracts(
             query.push(", c.id ");
             query.push(id_direction);
         }
+        shared::SortBy::Deployments => "c.deployment_count".to_string(),
         shared::SortBy::Relevance => {
             if let Some(ref q) = params.query {
                 let prefix = format!("{}%", q.to_ascii_lowercase());
@@ -1860,6 +1861,14 @@ pub async fn create_contract_version(
     .execute(&mut *tx)
     .await
     .map_err(|err| db_internal_error("insert contract abi", err))?;
+
+    sqlx::query(
+        "UPDATE contracts SET deployment_count = deployment_count + 1 WHERE id = $1",
+    )
+    .bind(contract_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("increment deployment count", err))?;
 
     tx.commit()
         .await
@@ -2860,6 +2869,7 @@ pub async fn verify_contract(
             .await
             .map_err(|err| db_internal_error("mark verification as verified", err))?;
 
+            // Update contract metadata (Issue #401)
             sqlx::query(
                 "UPDATE contracts SET is_verified = true, verified_at = NOW(), updated_at = NOW() WHERE id = $1",
             )

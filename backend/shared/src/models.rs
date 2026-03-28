@@ -182,6 +182,22 @@ pub enum VerificationStatus {
     Failed,
 }
 
+/// Security audit status of the contract (Issue #401)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "audit_status_type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuditStatus {
+    None,
+    Pending,
+    Passed,
+    Failed,
+}
+
+impl Default for AuditStatus {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Contract maturity level - indicates stability and production readiness
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub enum MaturityLevel {
