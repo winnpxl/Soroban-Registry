@@ -126,7 +126,7 @@ pub fn contract_routes() -> Router<AppState> {
         )
         .route(
             "/api/contracts/:id/analytics",
-            get(handlers::get_contract_analytics),
+            get(analytics_handlers::get_contract_analytics),
         )
         .route(
             "/api/analytics/dashboard",
@@ -291,6 +291,11 @@ pub fn health_routes() -> Router<AppState> {
         .route("/health/ready", get(handlers::health_check_ready))
         .route("/health/detailed", get(handlers::health_check_detailed))
         .route("/api/stats", get(handlers::get_stats))
+        // Registry-wide analytics summary (issue #415)
+        .route(
+            "/api/analytics/summary",
+            get(analytics_handlers::get_analytics_summary),
+        )
 }
 
 pub fn network_routes() -> Router<AppState> {
