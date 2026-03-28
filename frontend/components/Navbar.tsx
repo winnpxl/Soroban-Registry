@@ -11,7 +11,7 @@ export default function Navbar() {
     const [isDropdownOpen, setIsDropdownOpen] = useState(false);
     const [menuOpenForPath, setMenuOpenForPath] = useState<string | null>(null);
     const dropdownTimeout = useRef<NodeJS.Timeout | null>(null);
-    const pathname = usePathname();
+    const pathname = usePathname() ?? '';
 
     // Derive mobileMenuOpen: auto-closes when pathname changes
     const mobileMenuOpen = menuOpenForPath === pathname;
@@ -54,6 +54,29 @@ export default function Navbar() {
                             }`}
                         >
                             Browse
+                        </Link>
+                        <Link
+                            href="/compare"
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-all ${
+                                isActive('/compare')
+                                    ? 'text-primary bg-primary/10'
+                                    : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                            }`}
+                        >
+                            <Columns2 className="w-3 h-3" />
+                            Compare
+                        </Link>
+
+                        <Link
+                            href="/verify-contract"
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-all ${
+                                isActive('/verify-contract')
+                                    ? 'text-primary bg-primary/10'
+                                    : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                            }`}
+                        >
+                            <ShieldCheck className="w-3 h-3" />
+                            Verify
                         </Link>
 
                         {/* Explore Dropdown */}
@@ -177,6 +200,8 @@ export default function Navbar() {
                         <div className="flex flex-col gap-0.5">
                             {[
                                 { href: '/contracts', label: 'Browse Contracts', icon: Search },
+                                { href: '/compare', label: 'Compare Contracts', icon: Columns2 },
+                                { href: '/verify-contract', label: 'Verify Contract', icon: ShieldCheck },
                                 { href: '/publishers', label: 'Publishers', icon: Users },
                                 { href: '/stats', label: 'Statistics', icon: BarChart2 },
                                 { href: '/analytics', label: 'Analytics', icon: PieChart },
