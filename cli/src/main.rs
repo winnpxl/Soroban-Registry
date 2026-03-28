@@ -4,8 +4,10 @@ mod backup;
 mod batch_verify;
 mod commands;
 mod config;
+mod contracts;
 mod conversions;
 mod coverage;
+mod dashboard;
 mod events;
 mod export;
 mod formal_verification;
@@ -81,8 +83,16 @@ pub enum Commands {
 
     /// Get detailed information about a contract
     Info {
-        /// Contract registry UUID (use --network for network-specific config)
+        /// Contract registry identifier (UUID, contract address, or name)
         contract_id: String,
+
+        /// Output format (text, json, yaml)
+        #[arg(long, short = 'f', default_value = "text")]
+        format: String,
+
+        /// Highlight a specific ABI method
+        #[arg(long)]
+        highlight_method: Option<String>,
     },
 
     /// Publish a new contract to the registry
@@ -124,6 +134,19 @@ pub enum Commands {
         /// Output results as machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Launch an interactive, real-time terminal dashboard
+    Dashboard {
+        /// Minimum interval between UI renders (milliseconds)
+        #[arg(long, default_value = "100")]
+        refresh_rate: u64,
+        /// Filter by contract category
+        #[arg(long)]
+        category: Option<String>,
+        /// WebSocket URL (or set SOROBAN_REGISTRY_WS_URL)
+        #[arg(long, env = "SOROBAN_REGISTRY_WS_URL")]
+        ws_url: Option<String>,
     },
 
     /// Detect breaking changes between contract versions
@@ -592,6 +615,49 @@ pub enum ConfigSubcommands {
     },
 }
 
+/// Sub-commands for the `contracts` group
+#[derive(Debug, Subcommand)]
+pub enum ContractsCommands {
+    /// List contracts with filtering and pagination
+    List {
+        /// Filter by network (mainnet, testnet, futurenet)
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Filter by category (e.g., DEX, token, lending, oracle)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Maximum number of contracts to return
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Number of contracts to skip (for pagination)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+
+        /// Sort by field: name, created_at, health_score, network
+        #[arg(long, default_value = "created_at")]
+        sort_by: String,
+
+        /// Sort order: asc or desc
+        #[arg(long, default_value = "desc")]
+        sort_order: String,
+
+        /// Output format: table, json, or csv
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Output results as JSON (shorthand for --format json)
+        #[arg(long)]
+        json: bool,
+
+        /// Output results as CSV (shorthand for --format csv)
+        #[arg(long)]
+        csv: bool,
+    },
+}
+
 /// Sub-commands for the `sla` group
 #[derive(Debug, Subcommand)]
 pub enum SlaCommands {
@@ -937,9 +1003,25 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::Info { contract_id } => {
-            log::debug!("Command: info | contract_id={}", contract_id);
-            commands::info(&cli.api_url, &contract_id, cfg_network).await?;
+        Commands::Info {
+            contract_id,
+            format,
+            highlight_method,
+        } => {
+            log::debug!(
+                "Command: info | contract_id={} format={} highlight={:?}",
+                contract_id,
+                format,
+                highlight_method
+            );
+            commands::info(
+                &cli.api_url,
+                &contract_id,
+                &format,
+                highlight_method.as_deref(),
+                cfg_network,
+            )
+            .await?;
         }
         Commands::Publish {
             contract_id,
@@ -974,6 +1056,25 @@ async fn main() -> Result<()> {
         Commands::List { limit, json } => {
             log::debug!("Command: list | limit={}", limit);
             commands::list(&cli.api_url, limit, network, json).await?;
+        }
+        Commands::Dashboard {
+            refresh_rate,
+            category,
+            ws_url,
+        } => {
+            log::debug!(
+                "Command: dashboard | refresh_rate={} network={:?} category={:?}",
+                refresh_rate,
+                cli.network,
+                category
+            );
+            dashboard::run_dashboard(dashboard::DashboardParams {
+                refresh_rate_ms: refresh_rate,
+                network: cli.network.clone(),
+                category,
+                ws_url,
+            })
+            .await?;
         }
         Commands::BreakingChanges { old_id, new_id, json } => {
             log::debug!("Command: breaking-changes | old={} new={}", old_id, new_id);

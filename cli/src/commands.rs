@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use serde_yaml;
 use std::fmt;
 use std::fs;
 use std::str::FromStr;
@@ -611,14 +612,13 @@ pub async fn migrate(
     dry_run: bool,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
-    use std::fs;
     use tokio::process::Command;
 
     println!("\n{}", "Migration Tool".bold().cyan());
     println!("{}", "=".repeat(80).cyan());
 
     // 1. Read WASM file
-    let wasm_bytes = fs::read(wasm_path)
+    let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("Failed to read WASM file at {}", wasm_path))?;
 
     // 2. Compute Hash
@@ -627,7 +627,13 @@ pub async fn migrate(
     let wasm_hash = hex::encode(hasher.finalize());
 
     println!("Contract ID: {}", contract_id.green());
-@@ -298,51 +309,51 @@ pub async fn migrate(
+    println!("WASM Hash: {}", wasm_hash.bright_black());
+
+    if dry_run {
+        println!("\n{}", "Dry run enabled: not contacting the registry API.".yellow());
+        println!("{}", "✓ Migration simulation complete (dry-run).".green().bold());
+        return Ok(());
+    }
 
     // 3. Create Migration Record (Pending)
     let client = reqwest::Client::new();
@@ -654,7 +660,6 @@ pub async fn migrate(
 
     let migration: serde_json::Value = response.json().await?;
     let migration_id = extract_migration_id(&migration)?;
-    let migration_id = crate::conversions::as_str(&migration["id"], "id")?;
     println!("{}", "OK".green());
     println!("Migration ID: {}", migration_id);
 
@@ -680,87 +685,6 @@ pub async fn migrate(
             println!("{}", "Simulating SUCCESS...".green());
             (
                 shared::models::MigrationStatus::Success,
-@@ -626,51 +637,54 @@ pub fn doc(contract_path: &str, output_dir: &str) -> Result<()> {
-    println!("{} Documentation generated at {:?}", "✓".green(), out_path);
-    Ok(())
-}
-
-pub async fn profile(
-    contract_path: &str,
-    method: Option<&str>,
-    output: Option<&str>,
-    flamegraph: Option<&str>,
-    compare: Option<&str>,
-    show_recommendations: bool,
-) -> Result<()> {
-    let path = Path::new(contract_path);
-    if !path.exists() {
-        anyhow::bail!("Contract file not found: {}", contract_path);
-    }
-
-    println!("\n{}", "Profiling contract...".bold().cyan());
-    println!("{}", "=".repeat(80).cyan());
-
-    let mut profiler = profiler::Profiler::new();
-    profiler::simulate_execution(path, method, &mut profiler)?;
-    let profile_data = profiler.finish(contract_path.to_string(), method.map(|s| s.to_string()));
-
-    println!("\n{}", "Profile Results:".bold().green());
-    println!(
-        "Total Duration: {:.2}ms",
-        profile_data.total_duration.as_secs_f64() * 1000.0
-    );
-    println!("Overhead: {:.2}%", profile_data.overhead_percent);
-    println!("Functions Profiled: {}", profile_data.functions.len());
-
-    let mut sorted_functions: Vec<_> = profile_data.functions.values().collect();
-    sorted_functions.sort_by(|a, b| b.total_time.cmp(&a.total_time));
-
-    println!("\n{}", "Top Functions:".bold());
-    for (i, func) in sorted_functions.iter().take(10).enumerate() {
-        println!(
-            "{}. {} - {:.2}ms ({} calls, avg: {:.2}μs)",
-            i + 1,
-            func.name.bold(),
-            func.total_time.as_secs_f64() * 1000.0,
-            func.call_count,
-            func.avg_time.as_secs_f64() * 1_000_000.0
-        );
-    }
-
-    if let Some(output_path) = output {
-        let json = serde_json::to_string_pretty(&profile_data)?;
-        std::fs::write(output_path, json)
-            .with_context(|| format!("Failed to write profile to: {}", output_path))?;
-        println!("\n{} Profile exported to: {}", "✓".green(), output_path);
-    }
-
-@@ -687,202 +701,254 @@ pub async fn profile(
-        let comparisons = profiler::compare_profiles(&baseline, &profile_data);
-
-        println!("\n{}", "Comparison Results:".bold().yellow());
-        for comp in comparisons.iter().take(10) {
-            let sign = if comp.time_diff_ns > 0 { "+" } else { "" };
-            println!(
-                "{}: {} ({}{:.2}%, {:.2}ms → {:.2}ms)",
-                comp.function.bold(),
-                comp.status,
-                sign,
-                comp.time_diff_percent,
-                comp.baseline_time.as_secs_f64() * 1000.0,
-                comp.current_time.as_secs_f64() * 1000.0
-            );
-        }
-    }
-
-    if show_recommendations {
-        let recommendations = profiler::generate_recommendations(&profile_data);
-        println!("\n{}", "Recommendations:".bold().magenta());
-        for (i, rec) in recommendations.iter().enumerate() {
-            println!("{}. {}", i + 1, rec);
-        }
-    }
-
                 "Simulation: Migration succeeded.".to_string(),
             )
         }
@@ -1990,26 +1914,231 @@ pub async fn list_functions(api_url: &str, contract_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch contract info from the registry. `id` is the contract's registry UUID.
-/// Use --network to get network-specific config (e.g. mainnet, testnet).
-pub async fn info(api_url: &str, id: &str, network: crate::config::Network) -> Result<()> {
-    println!("\n{}", "Fetching contract information...".bold().cyan());
-    
-    let url = format!("{}/api/contracts/{}", api_url.trim_end_matches('/'), id);
+/// Fetch contract info from the registry. `id` is the contract's registry identifier.
+pub async fn info(
+    api_url: &str,
+    id: &str,
+    format: &str,
+    highlight_method: Option<&str>,
+    network: crate::config::Network,
+) -> Result<()> {
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
+    let base_url = api_url.trim_end_matches('/');
+
+    if format == "text" {
+        println!("\n{}", "Fetching contract information...".bold().cyan());
+    }
+
+    // 1. Fetch Metadata
+    let metadata_url = format!("{}/api/contracts/{}", base_url, id);
+    let metadata_res = client
+        .get(&metadata_url)
         .query(&[("network", network.to_string())])
         .send()
         .await?;
 
-    if response.status().is_success() {
-        let contract_info: serde_json::Value = response.json().await?;
-        println!("\n{}", serde_json::to_string_pretty(&contract_info)?);
+    if !metadata_res.status().is_success() {
+        anyhow::bail!("Failed to fetch contract metadata: {}", metadata_res.status());
+    }
+    let metadata: serde_json::Value = metadata_res.json().await?;
+
+    // Extract genuine UUID if 'id' was a name or address
+    let contract_uuid = metadata["contract"]["id"]
+        .as_str()
+        .context("Metadata missing contract ID")?;
+    let contract_address = metadata["contract"]["contract_id"]
+        .as_str()
+        .unwrap_or(id);
+
+    // 2. Fetch ABI
+    let abi_url = format!("{}/api/contracts/{}/abi", base_url, contract_uuid);
+    let abi_res = client.get(&abi_url).send().await;
+    let abi: Option<serde_json::Value> = if let Ok(res) = abi_res {
+        if res.status().is_success() {
+            res.json::<serde_json::Value>().await.ok().and_then(|v| v.get("abi").cloned())
+        } else {
+            None
+        }
     } else {
-        anyhow::bail!("Failed to fetch contract info: {}", response.status());
+        None
+    };
+
+    // 3. Fetch Deployments
+    let depl_url = format!("{}/api/contracts/{}/deployments", base_url, contract_uuid);
+    let depl_res = client.get(&depl_url).send().await;
+    let deployments: Vec<serde_json::Value> = if let Ok(res) = depl_res {
+        if res.status().is_success() {
+            res.json().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 4. Fetch Dependencies
+    let deps_url = format!("{}/api/contracts/{}/dependencies", base_url, contract_uuid);
+    let deps_res = client.get(&deps_url).send().await;
+    let dependencies: Vec<serde_json::Value> = if let Ok(res) = deps_res {
+        if res.status().is_success() {
+            res.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.get("dependencies").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 5. Fetch Dependents (Related Contracts)
+    let relate_url = format!("{}/api/contracts/{}/dependents", base_url, contract_uuid);
+    let relate_res = client.get(&relate_url).send().await;
+    let dependents: Vec<serde_json::Value> = if let Ok(res) = relate_res {
+        if res.status().is_success() {
+            res.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.get("dependents").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 6. Fetch Versions (for verification status)
+    let versions_url = format!("{}/api/contracts/{}/versions", base_url, contract_uuid);
+    let versions_res = client.get(&versions_url).send().await;
+    let versions: Vec<serde_json::Value> = if let Ok(res) = versions_res {
+        if res.status().is_success() {
+            res.json().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Aggregate data
+    let full_info = json!({
+        "metadata": metadata["contract"],
+        "current_network_config": metadata["network_config"],
+        "abi": abi,
+        "deployments": deployments,
+        "dependencies": dependencies,
+        "dependents": dependents,
+        "versions": versions,
+    });
+
+    // Render output
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&full_info)?);
+        }
+        "yaml" => {
+            let yaml = serde_yaml::to_string(&full_info)?;
+            println!("{}", yaml);
+        }
+        _ => {
+            render_info_text(
+                &full_info,
+                highlight_method,
+                contract_address,
+                &network.to_string()
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+fn render_info_text(
+    info: &serde_json::Value,
+    highlight_method: Option<&str>,
+    contract_address: &str,
+    network_str: &str,
+) -> Result<()> {
+    let metadata = &info["metadata"];
+    let name = metadata["name"].as_str().unwrap_or("Unknown");
+    let desc = metadata["description"].as_str().unwrap_or("No description provided.");
+    let is_verified = metadata["is_verified"].as_bool().unwrap_or(false);
+    let health_score = metadata["health_score"].as_i64().unwrap_or(0);
+
+    println!("\n{}", "=".repeat(80).cyan());
+    println!("{} {}", "CONTRACT:".bold(), name.bold().green());
+    println!("{} {}", "ID:      ".bold(), contract_address.yellow());
+    println!("{} {}", "STATUS:  ".bold(), if is_verified { "Verified".green().bold() } else { "Unverified".red() });
+    println!("{} {}/100", "HEALTH:  ".bold(), health_score);
+    println!("{} {}", "DESC:    ".bold(), desc);
+    println!("{}", "=".repeat(80).cyan());
+
+    // Explorer Links
+    println!("\n{}", "BLOCK EXPLORERS:".bold().underline());
+    let explorer_url = match network_str {
+        "testnet" => format!("https://stellar.expert/explorer/testnet/contract/{}", contract_address),
+        "futurenet" => format!("https://stellar.expert/explorer/futurenet/contract/{}", contract_address),
+        _ => format!("https://stellar.expert/explorer/public/contract/{}", contract_address),
+    };
+    println!("  • StellarExpert: {}", explorer_url.blue().underline());
+
+    // ABI Methods
+    if let Some(abi) = info["abi"].as_array() {
+        println!("\n{}", "ABI METHODS:".bold().underline());
+        for item in abi {
+            if item["type"] == "function" {
+                let m_name = item["name"].as_str().unwrap_or("unknown");
+                let mut line = format!("  • {}", m_name);
+                if let Some(target) = highlight_method {
+                    if m_name == target {
+                        line = format!("  • {}", m_name.on_yellow().black().bold());
+                    }
+                }
+                println!("{}", line);
+            }
+        }
+    }
+
+    // Deployments
+    if let Some(depls) = info["deployments"].as_array() {
+        if !depls.is_empty() {
+            println!("\n{}", "DEPLOYMENTS:".bold().underline());
+            for d in depls {
+                let env = d["environment"].as_str().unwrap_or("unknown");
+                let status = d["status"].as_str().unwrap_or("unknown");
+                let date = d["deployed_at"].as_str().unwrap_or("");
+                println!("  • {:<10} | {:<10} | {}", env, status, date);
+            }
+        }
+    }
+
+    // Dependencies
+    if let Some(deps) = info["dependencies"].as_array() {
+        if !deps.is_empty() {
+            println!("\n{}", "DEPENDENCIES:".bold().underline());
+            for d in deps {
+                let d_name = d["dependency_name"].as_str().unwrap_or("unknown");
+                let constraint = d["version_constraint"].as_str().unwrap_or("*");
+                println!("  • {} ({})", d_name, constraint);
+            }
+        }
+    }
+
+    // Related Contracts (Dependents)
+    if let Some(deps) = info["dependents"].as_array() {
+        if !deps.is_empty() {
+            println!("\n{}", "RELATED CONTRACTS (DEPENDENTS):".bold().underline());
+            for d in deps {
+                let d_name = d["dependency_name"].as_str().unwrap_or("unknown"); // This is from the perspective of the dependent
+                // Wait, it should use the contract name if available.
+                // But dependents might just be a list of contract IDs.
+                println!("  • Contract ID: {}", d["contract_id"]);
+            }
+        }
+    }
+
+    println!("\n{}", "=".repeat(80).cyan());
     Ok(())
 }
 

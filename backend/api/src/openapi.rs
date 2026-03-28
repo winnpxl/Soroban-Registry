@@ -3,6 +3,7 @@ use crate::custom_metrics_handlers;
 use crate::deprecation_handlers;
 use crate::handlers;
 use crate::metrics_handler;
+use crate::similarity_handlers;
 use serde_json::Value;
 use shared::models::*;
 use utoipa::OpenApi;
@@ -13,8 +14,13 @@ use utoipa::OpenApi;
         handlers::health_check,
         handlers::get_stats,
         handlers::list_contracts,
+        handlers::get_contracts_batch,
         handlers::get_contract,
         handlers::get_contract_versions,
+        handlers::get_contract_changelog,
+        handlers::get_trust_score,
+        // `get_contract_state` / `update_contract_state` are currently stubs without
+        // `#[utoipa::path]`, and break OpenAPI generation. Omit until implemented.
         handlers::create_contract_version,
         handlers::publish_contract,
         handlers::create_publisher,
@@ -29,6 +35,8 @@ use utoipa::OpenApi;
         handlers::get_contract_graph,
         handlers::get_impact_analysis,
         handlers::get_trending_contracts,
+        similarity_handlers::get_similar_contracts,
+        similarity_handlers::analyze_contract_similarity_batch,
         handlers::verify_contract,
         handlers::update_contract_metadata,
         handlers::change_contract_publisher,
@@ -41,6 +49,8 @@ use utoipa::OpenApi;
         handlers::get_contract_interactions,
         handlers::post_contract_interaction,
         handlers::post_contract_interactions_batch,
+        crate::auth_handlers::get_challenge,
+        crate::auth_handlers::verify_challenge,
         breaking_changes::get_breaking_changes,
         custom_metrics_handlers::get_metric_catalog,
         custom_metrics_handlers::get_contract_metrics,
@@ -71,16 +81,22 @@ use utoipa::OpenApi;
             DeploymentEnvironment,
             CanaryRelease,
             ABTest,
+            ContractSimilaritySignature,
+            ContractSimilarityReport,
+            SimilarityMatchType,
+            SimilarityReviewStatus,
+            ContractSimilarityResult,
+            ContractSimilarityResponse,
+            BatchSimilarityAnalysisRequest,
+            BatchSimilarityAnalysisItem,
+            BatchSimilarityAnalysisResponse,
             PerformanceMetric,
             CustomMetric,
-            MetricAnomaly,
-            AnalyticsReport,
-            ContractAuditLogEntry,
+            PerformanceAnomaly,
+            crate::handlers::ContractAuditLogEntry,
             ContractInteraction,
-            ArtifactType,
             ContractDependency,
             ImpactAnalysisResponse,
-            VerificationRequest,
             VerifyRequest,
             ContractAnalyticsResponse,
             DeploymentStats,
@@ -100,9 +116,14 @@ use utoipa::OpenApi;
             ContractInteractionResponse,
             CreateInteractionRequest,
             CreateInteractionBatchRequest,
+            crate::auth_handlers::ChallengeResponse,
+            crate::auth_handlers::VerifyRequest as AuthVerifyRequest,
+            crate::auth_handlers::VerifyResponse,
             breaking_changes::ChangeSeverity,
             breaking_changes::BreakingChange,
             breaking_changes::BreakingChangeReport,
+            ContractChangelogEntry,
+            ContractChangelogResponse,
             custom_metrics_handlers::MetricSeriesResponse,
             custom_metrics_handlers::MetricSeriesPoint,
             custom_metrics_handlers::MetricSampleResponse,
@@ -111,6 +132,7 @@ use utoipa::OpenApi;
         )
     ),
     tags(
+        (name = "Authentication", description = "Wallet-based authentication with challenge/verify"),
         (name = "Observability", description = "Monitor API health and performance"),
         (name = "Contracts", description = "Everything about contracts"),
         (name = "Publishers", description = "Publisher management"),
@@ -123,6 +145,8 @@ use utoipa::OpenApi;
         (name = "Maintenance", description = "Deprecation and version management"),
         (name = "Administration", description = "Administrative audit logs"),
         (name = "Deployments", description = "Deployment management"),
+        (name = "Versions", description = "Contract version history and management"),
+        (name = "Security", description = "Security and trust score assessments"),
     ),
     modifiers(&SecurityAddon)
 )]
