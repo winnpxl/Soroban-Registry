@@ -35,6 +35,30 @@ pub fn contract_routes() -> Router<AppState> {
             get(handlers::list_contracts).post(handlers::publish_contract),
         )
         .route(
+            "/api/contracts/export",
+            post(handlers::export_contract_metadata),
+        )
+        .route(
+            "/contracts/export",
+            post(handlers::export_contract_metadata),
+        )
+        .route(
+            "/api/contracts/export/:job_id",
+            get(handlers::get_contract_export_status),
+        )
+        .route(
+            "/contracts/export/:job_id",
+            get(handlers::get_contract_export_status),
+        )
+        .route(
+            "/api/contracts/export/:job_id/download",
+            get(handlers::download_contract_export),
+        )
+        .route(
+            "/contracts/export/:job_id/download",
+            get(handlers::download_contract_export),
+        )
+        .route(
             "/api/contracts/suggestions",
             get(handlers::get_contract_search_suggestions),
         )

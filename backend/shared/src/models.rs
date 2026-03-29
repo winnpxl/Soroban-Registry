@@ -644,7 +644,7 @@ pub enum SortOrder {
 }
 
 /// Search/filter parameters for contracts
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct ContractSearchParams {
     pub query: Option<String>,
     pub network: Option<Network>,
@@ -671,6 +671,113 @@ pub struct ContractSearchParams {
     pub verified_to: Option<DateTime<Utc>>,
     pub last_accessed_from: Option<DateTime<Utc>>,
     pub last_accessed_to: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ContractExportFormat {
+    Json,
+    Csv,
+    Yaml,
+}
+
+impl std::fmt::Display for ContractExportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json => write!(f, "json"),
+            Self::Csv => write!(f, "csv"),
+            Self::Yaml => write!(f, "yaml"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractExportRequest {
+    pub format: ContractExportFormat,
+    #[serde(default)]
+    pub filters: ContractSearchParams,
+    #[serde(default)]
+    pub async_mode: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ContractMetadataExportRecord {
+    pub id: Uuid,
+    pub logical_id: Option<Uuid>,
+    pub contract_id: String,
+    pub wasm_hash: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub publisher_id: Uuid,
+    pub publisher_stellar_address: String,
+    pub publisher_username: Option<String>,
+    pub network: String,
+    pub is_verified: bool,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub maturity: Option<String>,
+    pub health_score: i32,
+    pub is_maintenance: bool,
+    pub deployment_count: i32,
+    pub audit_status: Option<String>,
+    pub visibility: String,
+    pub organization_id: Option<Uuid>,
+    pub network_configs: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub last_verified_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractExportMetadata {
+    pub exported_at: DateTime<Utc>,
+    pub format: ContractExportFormat,
+    pub total_count: i64,
+    pub async_export: bool,
+    pub filters: ContractSearchParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractMetadataExportEnvelope {
+    pub metadata: ContractExportMetadata,
+    pub contracts: Vec<ContractMetadataExportRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractExportJobStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractExportAcceptedResponse {
+    pub job_id: Uuid,
+    pub status: ContractExportJobStatus,
+    pub status_url: String,
+    pub download_url: Option<String>,
+    pub total_count: i64,
+    pub format: ContractExportFormat,
+    pub requested_at: DateTime<Utc>,
+    pub filters: ContractSearchParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractExportStatusResponse {
+    pub job_id: Uuid,
+    pub status: ContractExportJobStatus,
+    pub status_url: String,
+    pub download_url: Option<String>,
+    pub total_count: i64,
+    pub format: ContractExportFormat,
+    pub requested_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub filters: ContractSearchParams,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

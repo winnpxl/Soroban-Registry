@@ -12,6 +12,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use shared::{
     pagination::Cursor, AdvancedSearchRequest, AnalyticsEventType, AuditActionType,
@@ -28,9 +29,11 @@ use shared::{
     SearchSuggestionsResponse, SemVer, TrendingParams, UpdateContractMetadataRequest,
     UpdateContractStatusRequest, VerifyRequest,
 };
-use sqlx::QueryBuilder;
+use sqlx::{Postgres, QueryBuilder};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path as StdPath, PathBuf};
 use std::time::Duration;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Query params for GET /contracts/:id (Issue #43)
@@ -129,6 +132,24 @@ const NETWORK_DEGRADED_FAILURE_THRESHOLD: i32 = 1;
 const NETWORK_OFFLINE_FAILURE_THRESHOLD: i32 = 5;
 const NETWORK_STALE_AFTER_MINUTES: i64 = 10;
 const SLOW_SEARCH_QUERY_THRESHOLD_MS: u128 = 200;
+const ASYNC_EXPORT_ROW_THRESHOLD: i64 = 1_000;
+const EXPORT_ARTIFACT_DIR: &str = "soroban-registry-exports";
+
+#[derive(Debug, Clone)]
+struct ContractExportJob {
+    job_id: Uuid,
+    status: ContractExportJobStatus,
+    format: ContractExportFormat,
+    filters: ContractSearchParams,
+    total_count: i64,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    artifact_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+static EXPORT_JOBS: Lazy<RwLock<HashMap<Uuid, ContractExportJob>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 fn observe_search_query(
     kind: &str,
@@ -1304,6 +1325,605 @@ pub async fn list_contracts(
     }
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+fn maturity_filter_value(level: &shared::MaturityLevel) -> &'static str {
+    match level {
+        shared::MaturityLevel::Experimental => "alpha",
+        shared::MaturityLevel::Beta => "beta",
+        shared::MaturityLevel::Stable => "stable",
+        shared::MaturityLevel::Production => "mature",
+    }
+}
+
+fn sanitized_export_filters(mut filters: ContractSearchParams) -> ContractSearchParams {
+    filters.page = None;
+    filters.limit = None;
+    filters.offset = None;
+    filters.cursor = None;
+    filters
+}
+
+fn export_artifact_dir() -> PathBuf {
+    std::env::temp_dir().join(EXPORT_ARTIFACT_DIR)
+}
+
+fn export_artifact_extension(format: &ContractExportFormat) -> &'static str {
+    match format {
+        ContractExportFormat::Json => "json",
+        ContractExportFormat::Csv => "csv",
+        ContractExportFormat::Yaml => "yaml",
+    }
+}
+
+fn export_content_type(format: &ContractExportFormat) -> &'static str {
+    match format {
+        ContractExportFormat::Json => "application/json",
+        ContractExportFormat::Csv => "text/csv; charset=utf-8",
+        ContractExportFormat::Yaml => "application/x-yaml",
+    }
+}
+
+fn export_filename(format: &ContractExportFormat, total_count: i64) -> String {
+    format!(
+        "contract-metadata-export-{}-{}.{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        total_count,
+        export_artifact_extension(format)
+    )
+}
+
+fn export_artifact_path(job_id: Uuid, format: &ContractExportFormat) -> PathBuf {
+    export_artifact_dir().join(format!("{}.{}", job_id, export_artifact_extension(format)))
+}
+
+fn build_export_status_response(job: &ContractExportJob) -> ContractExportStatusResponse {
+    ContractExportStatusResponse {
+        job_id: job.job_id,
+        status: job.status.clone(),
+        status_url: format!("/contracts/export/{}", job.job_id),
+        download_url: job
+            .artifact_path
+            .as_ref()
+            .filter(|_| job.status == ContractExportJobStatus::Completed)
+            .map(|_| format!("/contracts/export/{}/download", job.job_id)),
+        total_count: job.total_count,
+        format: job.format.clone(),
+        requested_at: job.requested_at,
+        completed_at: job.completed_at,
+        filters: job.filters.clone(),
+        error: job.error.clone(),
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn optional_json_string(value: &Option<serde_json::Value>) -> String {
+    value
+        .as_ref()
+        .map(|inner| inner.to_string())
+        .unwrap_or_default()
+}
+
+fn optional_datetime_string(value: &Option<chrono::DateTime<chrono::Utc>>) -> String {
+    value.map(|inner| inner.to_rfc3339()).unwrap_or_default()
+}
+
+fn optional_uuid_string(value: &Option<Uuid>) -> String {
+    value.map(|inner| inner.to_string()).unwrap_or_default()
+}
+
+fn optional_string(value: &Option<String>) -> String {
+    value.clone().unwrap_or_default()
+}
+
+fn render_contract_export(
+    format: &ContractExportFormat,
+    metadata: &ContractExportMetadata,
+    contracts: &[ContractMetadataExportRecord],
+) -> ApiResult<String> {
+    match format {
+        ContractExportFormat::Json => {
+            serde_json::to_string_pretty(&ContractMetadataExportEnvelope {
+                metadata: metadata.clone(),
+                contracts: contracts.to_vec(),
+            })
+            .map_err(|err| ApiError::internal(format!("Failed to render JSON export: {err}")))
+        }
+        ContractExportFormat::Yaml => serde_yaml::to_string(&ContractMetadataExportEnvelope {
+            metadata: metadata.clone(),
+            contracts: contracts.to_vec(),
+        })
+        .map_err(|err| ApiError::internal(format!("Failed to render YAML export: {err}"))),
+        ContractExportFormat::Csv => {
+            let mut csv = String::new();
+            let filters_json = serde_json::to_string(&metadata.filters).map_err(|err| {
+                ApiError::internal(format!("Failed to encode filter metadata: {err}"))
+            })?;
+            csv.push_str(&format!(
+                "# exported_at={}\n",
+                metadata.exported_at.to_rfc3339()
+            ));
+            csv.push_str(&format!("# format={}\n", metadata.format));
+            csv.push_str(&format!("# total_count={}\n", metadata.total_count));
+            csv.push_str(&format!("# filters={filters_json}\n"));
+            csv.push_str("id,logical_id,contract_id,wasm_hash,name,description,publisher_id,publisher_stellar_address,publisher_username,network,is_verified,category,tags,maturity,health_score,is_maintenance,deployment_count,audit_status,visibility,organization_id,network_configs,created_at,updated_at,verified_at,last_verified_at,last_accessed_at\n");
+
+            for contract in contracts {
+                let tags = contract.tags.join("|");
+                let row = [
+                    contract.id.to_string(),
+                    optional_uuid_string(&contract.logical_id),
+                    contract.contract_id.clone(),
+                    contract.wasm_hash.clone(),
+                    contract.name.clone(),
+                    optional_string(&contract.description),
+                    contract.publisher_id.to_string(),
+                    contract.publisher_stellar_address.clone(),
+                    optional_string(&contract.publisher_username),
+                    contract.network.clone(),
+                    contract.is_verified.to_string(),
+                    optional_string(&contract.category),
+                    tags,
+                    optional_string(&contract.maturity),
+                    contract.health_score.to_string(),
+                    contract.is_maintenance.to_string(),
+                    contract.deployment_count.to_string(),
+                    optional_string(&contract.audit_status),
+                    contract.visibility.clone(),
+                    optional_uuid_string(&contract.organization_id),
+                    optional_json_string(&contract.network_configs),
+                    contract.created_at.to_rfc3339(),
+                    contract.updated_at.to_rfc3339(),
+                    optional_datetime_string(&contract.verified_at),
+                    optional_datetime_string(&contract.last_verified_at),
+                    optional_datetime_string(&contract.last_accessed_at),
+                ];
+
+                let escaped = row
+                    .iter()
+                    .map(|value| csv_escape(value))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                csv.push_str(&escaped);
+                csv.push('\n');
+            }
+
+            Ok(csv)
+        }
+    }
+}
+
+fn contract_export_response(
+    format: &ContractExportFormat,
+    total_count: i64,
+    content: String,
+) -> Response {
+    let mut response = Response::new(axum::body::Body::from(content));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(export_content_type(format)),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        export_filename(format, total_count)
+    )) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+fn apply_contract_export_filters<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    filters: &'a ContractSearchParams,
+    claims: Option<&'a shared::AuthClaims>,
+) {
+    query.push(" FROM contracts c JOIN publishers p ON p.id = c.publisher_id WHERE (c.visibility = 'public'");
+    if let Some(claims) = claims {
+        query.push(
+            " OR (c.visibility = 'private' AND c.organization_id IN (SELECT organization_id FROM organization_members om JOIN publishers p2 ON om.publisher_id = p2.id WHERE p2.stellar_address = ",
+        );
+        query.push_bind(&claims.sub);
+        query.push("))");
+    }
+    query.push(")");
+
+    if filters.verified_only.unwrap_or(false) {
+        query.push(" AND c.is_verified = true");
+    }
+
+    if let Some(network) = filters.network.as_ref() {
+        query.push(" AND c.network = ");
+        query.push_bind(network);
+    }
+
+    if let Some(networks) = filters
+        .networks
+        .as_ref()
+        .filter(|networks| !networks.is_empty())
+    {
+        query.push(" AND c.network IN (");
+        let mut separated = query.separated(", ");
+        for network in networks {
+            separated.push_bind(network);
+        }
+        separated.push_unseparated(")");
+    }
+
+    if let Some(category) = filters.category.as_ref() {
+        query.push(" AND c.category = ");
+        query.push_bind(category);
+    }
+
+    if let Some(categories) = filters
+        .categories
+        .as_ref()
+        .filter(|categories| !categories.is_empty())
+    {
+        query.push(" AND c.category IN (");
+        let mut separated = query.separated(", ");
+        for category in categories {
+            separated.push_bind(category);
+        }
+        separated.push_unseparated(")");
+    }
+
+    if let Some(tags) = filters.tags.as_ref().filter(|tags| !tags.is_empty()) {
+        query.push(" AND EXISTS (SELECT 1 FROM unnest(c.tags) AS tag WHERE tag IN (");
+        let mut separated = query.separated(", ");
+        for tag in tags {
+            separated.push_bind(tag);
+        }
+        separated.push_unseparated("))");
+    }
+
+    if let Some(maturity) = filters.maturity.as_ref() {
+        query.push(" AND c.maturity::text = ");
+        query.push_bind(maturity_filter_value(maturity));
+    }
+
+    if let Some(query_text) = filters
+        .query
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let search_pattern = format!("%{}%", query_text.to_ascii_lowercase());
+        query.push(" AND (");
+        query.push("c.search_vector @@ plainto_tsquery('english', ");
+        query.push_bind(query_text);
+        query.push(") OR lower(c.name) LIKE ");
+        query.push_bind(&search_pattern);
+        query.push(" OR lower(coalesce(c.description, '')) LIKE ");
+        query.push_bind(&search_pattern);
+        query.push(" OR lower(c.contract_id) LIKE ");
+        query.push_bind(&search_pattern);
+        query.push(")");
+    }
+
+    if let Some(created_from) = filters.created_from.clone() {
+        query.push(" AND c.created_at >= ");
+        query.push_bind(created_from);
+    }
+
+    if let Some(created_to) = filters.created_to.clone() {
+        query.push(" AND c.created_at <= ");
+        query.push_bind(created_to);
+    }
+
+    if let Some(updated_from) = filters.updated_from.clone() {
+        query.push(" AND c.updated_at >= ");
+        query.push_bind(updated_from);
+    }
+
+    if let Some(updated_to) = filters.updated_to.clone() {
+        query.push(" AND c.updated_at <= ");
+        query.push_bind(updated_to);
+    }
+
+    if let Some(verified_from) = filters.verified_from.clone() {
+        query.push(" AND c.verified_at >= ");
+        query.push_bind(verified_from);
+    }
+
+    if let Some(verified_to) = filters.verified_to.clone() {
+        query.push(" AND c.verified_at <= ");
+        query.push_bind(verified_to);
+    }
+
+    if let Some(last_accessed_from) = filters.last_accessed_from.clone() {
+        query.push(" AND c.last_accessed_at >= ");
+        query.push_bind(last_accessed_from);
+    }
+
+    if let Some(last_accessed_to) = filters.last_accessed_to.clone() {
+        query.push(" AND c.last_accessed_at <= ");
+        query.push_bind(last_accessed_to);
+    }
+}
+
+async fn count_contract_export_rows(
+    state: &AppState,
+    filters: &ContractSearchParams,
+    claims: Option<&shared::AuthClaims>,
+) -> ApiResult<i64> {
+    let mut query = QueryBuilder::<Postgres>::new("SELECT COUNT(*)");
+    apply_contract_export_filters(&mut query, filters, claims);
+    query
+        .build_query_scalar()
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count contracts for export", err))
+}
+
+async fn fetch_contract_export_rows(
+    state: &AppState,
+    filters: &ContractSearchParams,
+    claims: Option<&shared::AuthClaims>,
+) -> ApiResult<Vec<ContractMetadataExportRecord>> {
+    let sort_by = filters.sort_by.clone().unwrap_or(shared::SortBy::CreatedAt);
+    let sort_order = filters
+        .sort_order
+        .clone()
+        .unwrap_or(shared::SortOrder::Desc);
+    let direction = if sort_order == shared::SortOrder::Asc {
+        "ASC"
+    } else {
+        "DESC"
+    };
+
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT c.id, c.logical_id, c.contract_id, c.wasm_hash, c.name, c.description, c.publisher_id, \
+         p.stellar_address AS publisher_stellar_address, p.username AS publisher_username, \
+         c.network::text AS network, c.is_verified, c.category, c.tags, c.maturity::text AS maturity, \
+         c.health_score, c.is_maintenance, c.deployment_count, c.audit_status::text AS audit_status, \
+         c.visibility::text AS visibility, c.organization_id, c.network_configs, c.created_at, \
+         c.updated_at, c.verified_at, c.last_verified_at, c.last_accessed_at",
+    );
+
+    apply_contract_export_filters(&mut query, filters, claims);
+
+    query.push(" ORDER BY ");
+    match sort_by {
+        shared::SortBy::UpdatedAt => query.push("c.updated_at "),
+        shared::SortBy::VerifiedAt => query.push("c.verified_at "),
+        shared::SortBy::LastAccessedAt => query.push("c.last_accessed_at "),
+        shared::SortBy::Popularity | shared::SortBy::Interactions => {
+            query.push("c.last_accessed_at ")
+        }
+        shared::SortBy::Deployments => query.push("c.deployment_count "),
+        shared::SortBy::Relevance => {
+            if let Some(query_text) = filters
+                .query
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                query.push("ts_rank_cd(c.search_vector, plainto_tsquery('english', ");
+                query.push_bind(query_text);
+                query.push(")) ");
+            } else {
+                query.push("c.created_at ");
+            }
+        }
+        shared::SortBy::CreatedAt => query.push("c.created_at "),
+    };
+    query.push(direction);
+    query.push(" NULLS LAST, c.id ");
+    query.push(direction);
+
+    query
+        .build_query_as::<ContractMetadataExportRecord>()
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch contracts for export", err))
+}
+
+async fn generate_contract_export_payload(
+    state: &AppState,
+    filters: &ContractSearchParams,
+    format: &ContractExportFormat,
+    claims: Option<&shared::AuthClaims>,
+    async_export: bool,
+) -> ApiResult<(String, i64)> {
+    let contracts = fetch_contract_export_rows(state, filters, claims).await?;
+    let metadata = ContractExportMetadata {
+        exported_at: chrono::Utc::now(),
+        format: format.clone(),
+        total_count: contracts.len() as i64,
+        async_export,
+        filters: filters.clone(),
+    };
+    let rendered = render_contract_export(format, &metadata, &contracts)?;
+    Ok((rendered, contracts.len() as i64))
+}
+
+async fn persist_contract_export_artifact(path: &StdPath, content: String) -> ApiResult<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+            ApiError::internal(format!("Failed to prepare export directory: {err}"))
+        })?;
+    }
+
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|err| ApiError::internal(format!("Failed to write export artifact: {err}")))?;
+    Ok(())
+}
+
+#[utoipa::path(
+    post,
+    path = "/contracts/export",
+    request_body = ContractExportRequest,
+    responses(
+        (status = 200, description = "Contract metadata export stream"),
+        (status = 202, description = "Large export accepted", body = ContractExportAcceptedResponse),
+        (status = 400, description = "Invalid export request")
+    ),
+    tag = "Contracts"
+)]
+pub async fn export_contract_metadata(
+    State(state): State<AppState>,
+    claims: Option<shared::AuthClaims>,
+    ValidatedJson(req): ValidatedJson<ContractExportRequest>,
+) -> ApiResult<Response> {
+    let filters = sanitized_export_filters(req.filters.clone());
+    let total_count = count_contract_export_rows(&state, &filters, claims.as_ref()).await?;
+    let should_run_async =
+        req.async_mode.unwrap_or(false) || total_count > ASYNC_EXPORT_ROW_THRESHOLD;
+
+    if should_run_async {
+        let job_id = Uuid::new_v4();
+        let job = ContractExportJob {
+            job_id,
+            status: ContractExportJobStatus::Pending,
+            format: req.format.clone(),
+            filters: filters.clone(),
+            total_count,
+            requested_at: chrono::Utc::now(),
+            completed_at: None,
+            artifact_path: None,
+            error: None,
+        };
+
+        EXPORT_JOBS.write().await.insert(job_id, job.clone());
+
+        let state_clone = state.clone();
+        let filters_clone = filters.clone();
+        let format_clone = req.format.clone();
+        let claims_clone = claims.clone();
+
+        tokio::spawn(async move {
+            {
+                let mut jobs = EXPORT_JOBS.write().await;
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.status = ContractExportJobStatus::Processing;
+                    job.error = None;
+                }
+            }
+
+            let outcome = async {
+                let (content, _) = generate_contract_export_payload(
+                    &state_clone,
+                    &filters_clone,
+                    &format_clone,
+                    claims_clone.as_ref(),
+                    true,
+                )
+                .await?;
+                let artifact_path = export_artifact_path(job_id, &format_clone);
+                persist_contract_export_artifact(&artifact_path, content).await?;
+                Ok::<PathBuf, ApiError>(artifact_path)
+            }
+            .await;
+
+            let mut jobs = EXPORT_JOBS.write().await;
+            if let Some(job) = jobs.get_mut(&job_id) {
+                match outcome {
+                    Ok(artifact_path) => {
+                        job.status = ContractExportJobStatus::Completed;
+                        job.completed_at = Some(chrono::Utc::now());
+                        job.artifact_path = Some(artifact_path);
+                    }
+                    Err(err) => {
+                        tracing::error!(job_id = %job_id, error = %err, "contract export job failed");
+                        job.status = ContractExportJobStatus::Failed;
+                        job.completed_at = Some(chrono::Utc::now());
+                        job.error = Some(err.to_string());
+                    }
+                }
+            }
+        });
+
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ContractExportAcceptedResponse {
+                job_id,
+                status: ContractExportJobStatus::Pending,
+                status_url: format!("/contracts/export/{job_id}"),
+                download_url: None,
+                total_count,
+                format: req.format,
+                requested_at: job.requested_at,
+                filters,
+            }),
+        )
+            .into_response());
+    }
+
+    let (content, rendered_count) =
+        generate_contract_export_payload(&state, &filters, &req.format, claims.as_ref(), false)
+            .await?;
+    Ok(contract_export_response(
+        &req.format,
+        rendered_count,
+        content,
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/contracts/export/{job_id}",
+    params(
+        ("job_id" = Uuid, Path, description = "Export job ID")
+    ),
+    responses(
+        (status = 200, description = "Export job status", body = ContractExportStatusResponse),
+        (status = 404, description = "Export job not found")
+    ),
+    tag = "Contracts"
+)]
+pub async fn get_contract_export_status(
+    Path(job_id): Path<Uuid>,
+) -> ApiResult<Json<ContractExportStatusResponse>> {
+    let jobs = EXPORT_JOBS.read().await;
+    let job = jobs.get(&job_id).ok_or_else(|| {
+        ApiError::not_found("ExportNotFound", "No export job found for the supplied ID")
+    })?;
+    Ok(Json(build_export_status_response(job)))
+}
+
+pub async fn download_contract_export(Path(job_id): Path<Uuid>) -> ApiResult<Response> {
+    let job = {
+        let jobs = EXPORT_JOBS.read().await;
+        jobs.get(&job_id).cloned()
+    }
+    .ok_or_else(|| {
+        ApiError::not_found("ExportNotFound", "No export job found for the supplied ID")
+    })?;
+
+    match job.status {
+        ContractExportJobStatus::Pending | ContractExportJobStatus::Processing => Err(
+            ApiError::conflict("ExportNotReady", "The export is still being generated"),
+        ),
+        ContractExportJobStatus::Failed => {
+            Err(ApiError::internal(job.error.unwrap_or_else(|| {
+                "The export job failed before producing an artifact".to_string()
+            })))
+        }
+        ContractExportJobStatus::Completed => {
+            let artifact_path = job.artifact_path.ok_or_else(|| {
+                ApiError::internal("The export job completed without an artifact path")
+            })?;
+            let content = tokio::fs::read_to_string(&artifact_path)
+                .await
+                .map_err(|err| {
+                    ApiError::internal(format!("Failed to read export artifact: {err}"))
+                })?;
+            Ok(contract_export_response(
+                &job.format,
+                job.total_count,
+                content,
+            ))
+        }
+    }
 }
 
 /// Get a specific contract by ID. Optional ?network= returns network-specific config (Issue #43).
@@ -4919,6 +5539,110 @@ mod tests {
             derive_network_status(true, Some(&failing_snapshot), now).0,
             NetworkStatus::Offline
         );
+    }
+
+    fn sample_export_record() -> ContractMetadataExportRecord {
+        ContractMetadataExportRecord {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            logical_id: Some(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()),
+            contract_id: "CDUMMYEXPORT123".to_string(),
+            wasm_hash: "deadbeef".to_string(),
+            name: "Export Demo".to_string(),
+            description: Some("contract metadata export".to_string()),
+            publisher_id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            publisher_stellar_address: "GEXPORTADDRESS123".to_string(),
+            publisher_username: Some("exporter".to_string()),
+            network: "testnet".to_string(),
+            is_verified: true,
+            category: Some("DeFi".to_string()),
+            tags: vec!["yield".to_string(), "automation".to_string()],
+            maturity: Some("stable".to_string()),
+            health_score: 92,
+            is_maintenance: false,
+            deployment_count: 7,
+            audit_status: Some("PASSED".to_string()),
+            visibility: "public".to_string(),
+            organization_id: None,
+            network_configs: Some(json!({"testnet": {"contract_id": "CDUMMYEXPORT123"}})),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            verified_at: Some(Utc::now()),
+            last_verified_at: Some(Utc::now()),
+            last_accessed_at: Some(Utc::now()),
+        }
+    }
+
+    #[test]
+    fn contract_export_renderer_wraps_json_and_yaml_with_metadata() {
+        let filters = ContractSearchParams {
+            verified_only: Some(true),
+            ..Default::default()
+        };
+        let metadata = ContractExportMetadata {
+            exported_at: Utc::now(),
+            format: ContractExportFormat::Json,
+            total_count: 1,
+            async_export: false,
+            filters: filters.clone(),
+        };
+        let records = vec![sample_export_record()];
+
+        let json_output = render_contract_export(&ContractExportFormat::Json, &metadata, &records)
+            .expect("json export should render");
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_output).expect("json export should parse");
+        assert_eq!(json_value["metadata"]["total_count"], 1);
+        assert_eq!(json_value["metadata"]["filters"]["verified_only"], true);
+        assert_eq!(json_value["contracts"][0]["contract_id"], "CDUMMYEXPORT123");
+
+        let yaml_output = render_contract_export(&ContractExportFormat::Yaml, &metadata, &records)
+            .expect("yaml export should render");
+        assert!(yaml_output.contains("metadata:"));
+        assert!(yaml_output.contains("contracts:"));
+        assert!(yaml_output.contains("CDUMMYEXPORT123"));
+    }
+
+    #[test]
+    fn contract_export_renderer_prefixes_csv_with_metadata_comments() {
+        let metadata = ContractExportMetadata {
+            exported_at: Utc::now(),
+            format: ContractExportFormat::Csv,
+            total_count: 1,
+            async_export: true,
+            filters: ContractSearchParams {
+                category: Some("DeFi".to_string()),
+                ..Default::default()
+            },
+        };
+        let csv_output = render_contract_export(
+            &ContractExportFormat::Csv,
+            &metadata,
+            &[sample_export_record()],
+        )
+        .expect("csv export should render");
+
+        assert!(csv_output.starts_with("# exported_at="));
+        assert!(csv_output.contains("# filters="));
+        assert!(csv_output.contains("id,logical_id,contract_id"));
+        assert!(csv_output.contains("CDUMMYEXPORT123"));
+    }
+
+    #[test]
+    fn export_filters_drop_pagination_state() {
+        let sanitized = sanitized_export_filters(ContractSearchParams {
+            page: Some(3),
+            limit: Some(25),
+            offset: Some(50),
+            cursor: Some("abc".to_string()),
+            category: Some("DeFi".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(sanitized.page, None);
+        assert_eq!(sanitized.limit, None);
+        assert_eq!(sanitized.offset, None);
+        assert_eq!(sanitized.cursor, None);
+        assert_eq!(sanitized.category.as_deref(), Some("DeFi"));
     }
 }
 

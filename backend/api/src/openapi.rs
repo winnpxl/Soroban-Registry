@@ -14,6 +14,8 @@ use utoipa::OpenApi;
         handlers::health_check,
         handlers::get_stats,
         handlers::list_contracts,
+        handlers::export_contract_metadata,
+        handlers::get_contract_export_status,
         handlers::get_contracts_batch,
         handlers::get_contract,
         handlers::get_contract_versions,
@@ -71,6 +73,14 @@ use utoipa::OpenApi;
     components(
         schemas(
             Contract,
+            ContractExportFormat,
+            ContractExportRequest,
+            ContractExportMetadata,
+            ContractMetadataExportRecord,
+            ContractMetadataExportEnvelope,
+            ContractExportJobStatus,
+            ContractExportAcceptedResponse,
+            ContractExportStatusResponse,
             ContractGetResponse,
             NetworkConfig,
             Network,
