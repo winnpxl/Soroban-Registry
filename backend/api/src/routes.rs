@@ -575,3 +575,27 @@ pub fn websocket_routes() -> Router<AppState> {
         axum::routing::get(websocket::websocket_handler),
     )
 }
+
+pub fn validator_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/validators",
+            post(handlers::validators::register_validator).get(handlers::validators::list_validators),
+        )
+        .route(
+            "/api/validators/status",
+            get(handlers::validators::get_network_status),
+        )
+        .route(
+            "/api/validators/tasks",
+            get(handlers::validators::get_available_tasks),
+        )
+        .route(
+            "/api/validators/:id/attestations",
+            post(handlers::validators::submit_attestation),
+        )
+        .route(
+            "/api/validators/:id/performance",
+            get(handlers::validators::get_validator_performance),
+        )
+}

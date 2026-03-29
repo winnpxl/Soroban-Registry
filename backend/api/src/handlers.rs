@@ -1,4 +1,5 @@
 pub mod reviews;
+pub mod validators;
 
 use crate::validation::extractors::ValidatedJson;
 use axum::{
@@ -3118,6 +3119,16 @@ pub async fn create_contract_version(
         _ => db_internal_error("insert contract version", err),
     })?;
 
+    // Create verification task for the new version (Issue # validator network)
+    sqlx::query(
+        "INSERT INTO verification_tasks (contract_id, wasm_hash, status) VALUES ($1, $2, 'pending') ON CONFLICT DO NOTHING"
+    )
+    .bind(contract_uuid)
+    .bind(&req.wasm_hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("create verification task", err))?;
+
     sqlx::query(
         "INSERT INTO contract_abis (contract_id, version, abi) VALUES ($1, $2, $3) \
          ON CONFLICT (contract_id, version) DO UPDATE SET abi = EXCLUDED.abi",
@@ -3364,6 +3375,15 @@ pub async fn publish_contract(
         }
         db_internal_error("create contract", err)
     })?;
+
+    // Create verification task for the validator network (Issue # validator network)
+    let _ = sqlx::query(
+        "INSERT INTO verification_tasks (contract_id, wasm_hash, status) VALUES ($1, $2, 'pending') ON CONFLICT DO NOTHING"
+    )
+    .bind(contract.id)
+    .bind(&wasm_hash)
+    .execute(&state.db)
+    .await;
 
     // Set logical_id = id so this row is its own logical contract (Issue #43)
     let _ = sqlx::query("UPDATE contracts SET logical_id = id WHERE id = $1")

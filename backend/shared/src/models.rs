@@ -3026,3 +3026,117 @@ pub struct ReviewVoteResponse {
     pub helpful_count: i32,
     pub vote_recorded: bool,
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALIDATOR NETWORK TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "validator_status", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ValidatorStatus {
+    Active,
+    Inactive,
+    Slashed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct Validator {
+    pub id: Uuid,
+    pub stellar_address: String,
+    pub name: Option<String>,
+    pub status: ValidatorStatus,
+    pub stake_amount: Decimal,
+    pub reputation_score: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "verification_task_status", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationTaskStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct VerificationTask {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub version: String,
+    pub status: VerificationTaskStatus,
+    pub assigned_to: Option<Uuid>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "attestation_decision", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum AttestationDecision {
+    Valid,
+    Invalid,
+    Unknown,
+}
+
+impl std::fmt::Display for AttestationDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Valid => write!(f, "valid"),
+            Self::Invalid => write!(f, "invalid"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct Attestation {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub validator_id: Uuid,
+    pub decision: AttestationDecision,
+    pub compiled_wasm_hash: Option<String>,
+    pub error_message: Option<String>,
+    pub signature: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ValidatorPerformance {
+    pub validator_id: Uuid,
+    pub total_verifications: i32,
+    pub successful_verifications: i32,
+    pub failed_verifications: i32,
+    pub slashed_count: i32,
+    pub last_active_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegisterValidatorRequest {
+    pub stellar_address: String,
+    pub name: Option<String>,
+    pub stake_amount: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SubmitAttestationRequest {
+    pub task_id: Uuid,
+    pub decision: AttestationDecision,
+    pub compiled_wasm_hash: Option<String>,
+    pub error_message: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ValidatorNetworkStatus {
+    pub total_validators: i64,
+    pub active_validators: i64,
+    pub pending_tasks: i64,
+    pub completed_verifications: i64,
+    pub total_staked_amount: Decimal,
+}

@@ -277,6 +277,7 @@ async fn main() -> Result<()> {
         .merge(multisig_routes::routes())
         .merge(routes::observability_routes())
         .merge(routes::websocket_routes())
+        .merge(routes::validator_routes())
         .merge(release_notes_routes::release_notes_routes())
         .nest("/api", activity_feed_routes::routes())
         .fallback(handlers::route_not_found)
