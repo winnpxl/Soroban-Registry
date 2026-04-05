@@ -18,7 +18,7 @@ import QueryBuilder from '@/components/contracts/QueryBuilder';
 import FavoriteSearches from '@/components/contracts/FavoriteSearches';
 
 const DEFAULT_PAGE_SIZE = 12;
-const CATEGORY_OPTIONS = [
+const CATEGORY_OPTIONS_NAMES = [
   'DeFi',
   'NFT',
   'Governance',
@@ -28,6 +28,11 @@ const CATEGORY_OPTIONS = [
   'Gaming',
   'Social',
 ];
+const CATEGORY_OPTIONS = CATEGORY_OPTIONS_NAMES.map((cat) => ({
+  value: cat,
+  label: cat,
+  count: 0,
+}));
 const LANGUAGE_OPTIONS = [
   'Rust',
   'TypeScript',
@@ -450,6 +455,13 @@ export function ContractsContent() {
         setFilters((current) => ({
           ...current,
           categories: toggleOne(current.categories, value),
+          page: 1,
+        }))
+      }
+      onClearCategories={() =>
+        setFilters((current) => ({
+          ...current,
+          categories: [],
           page: 1,
         }))
       }

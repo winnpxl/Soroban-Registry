@@ -1,16 +1,17 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, AnalyticsEvent, AnalyticsEventType, ActivityFeedResponse } from '@/lib/api';
 import { useRealtime } from '@/hooks/useRealtime';
-import { 
-  Activity, 
-  Upload, 
-  CheckCircle2, 
-  RefreshCcw, 
-  UserPlus, 
-  ChevronDown, 
+import { formatPublicKey, formatShortenedText } from '@/lib/utils/formatting';
+import {
+  Activity,
+  Upload,
+  CheckCircle2,
+  RefreshCcw,
+  UserPlus,
+  ChevronDown,
   ExternalLink,
   Filter,
   Clock,
@@ -118,8 +119,7 @@ export default function ActivityFeed() {
 
   const formatAddress = (addr: string | null) => {
     if (!addr) return 'Unknown';
-    if (addr.length < 12) return addr;
-    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+    return formatPublicKey(addr);
   };
 
   const formatTime = (dateStr: string) => {
@@ -198,7 +198,7 @@ export default function ActivityFeed() {
                             href={`/contracts/${item.contract_id}`}
                             className="font-medium text-primary hover:underline flex items-center gap-1"
                           >
-                            {item.metadata?.name || item.contract_id.slice(0, 10) + '...'}
+                            {item.metadata?.name || formatShortenedText(item.contract_id, 10, '...')}
                             <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                           </Link>
                           {item.metadata?.version && (

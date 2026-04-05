@@ -712,7 +712,7 @@ function ContractDetailsContent() {
                   href={`/contracts/${id}/diff`}
                   className="flex items-center gap-1.5 rounded-xl border border-border bg-background px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
                 >
-                  <GitCompareIcon size={14} />
+                  <GitCompare size={14} />
                   View code diff
                 </Link>
               </div>

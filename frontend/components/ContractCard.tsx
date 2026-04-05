@@ -13,6 +13,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import React from 'react';
 import { useAnalytics } from '@/hooks/useAnalytics';
+import { formatContractId } from '@/lib/utils/formatting';
 import VerificationBadge from '@/components/verification/VerificationBadge';
 import HealthWidget from './HealthWidget';
 import ContractQuickViewModal from './contracts/ContractQuickViewModal';
@@ -38,7 +39,7 @@ export default function ContractCard({ contract }: ContractCardProps) {
     futurenet: 'bg-purple-500',
   };
 
-  const address = `${contract.contract_id.slice(0, 8)}...${contract.contract_id.slice(-6)}`;
+  const address = formatContractId(contract.contract_id);
   const categoryLabel = contract.category || 'uncategorized';
   const deploymentCount =
     typeof (contract as Contract & { deployment_count?: number }).deployment_count === 'number'
@@ -109,7 +110,7 @@ export default function ContractCard({ contract }: ContractCardProps) {
                   {contract.is_verified && <VerificationBadge status="approved" />}
                 </div>
                 <p className="font-mono text-xs text-muted-foreground">
-                  {contract.contract_id.slice(0, 8)}...{contract.contract_id.slice(-6)}
+                  {address}
                 </p>
               </div>
 
