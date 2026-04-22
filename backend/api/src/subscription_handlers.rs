@@ -2,8 +2,8 @@
 // Enable users to subscribe to alerts for contract updates and changes
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{OriginalUri, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::Utc;
@@ -12,14 +12,14 @@ use uuid::Uuid;
 use crate::{
     auth,
     error::{ApiError, ApiResult},
+    pagination::PagedJson,
     state::AppState,
 };
 use shared::{
     ContractSubscription, ContractSubscriptionSummary, CreateWebhookRequest,
     NotificationChannel, NotificationFrequency, NotificationQueueItem, NotificationType,
-    SubscribeRequest, SubscriptionStatus, UpdateSubscriptionRequest,
-    UpdateUserNotificationPreferencesRequest, UserNotificationPreferences,
-    UserSubscriptionsResponse, WebhookConfiguration,
+    PaginatedResponse, SubscribeRequest, SubscriptionStatus, UpdateSubscriptionRequest,
+    UpdateUserNotificationPreferencesRequest, UserNotificationPreferences, WebhookConfiguration,
 };
 
 // ─── Query / response types ────────────────────────────────────────────────
@@ -38,12 +38,6 @@ pub struct NotificationQuery {
     pub unread_only: Option<bool>,
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct NotificationListResponse {
-    pub notifications: Vec<NotificationQueueItem>,
-    pub total_count: i64,
-}
-
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 pub struct StatisticsQuery {
     pub period_start: chrono::NaiveDate,
@@ -54,6 +48,13 @@ pub struct StatisticsQuery {
 pub struct DeliveriesQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub page: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct ListWebhooksQuery {
+    pub limit: Option<i64>,
+    pub page: Option<i64>,
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -69,12 +70,6 @@ pub struct WebhookDeliveryLog {
     pub attempt_number: i32,
     pub delivery_duration_ms: Option<i64>,
     pub created_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct WebhookDeliveriesResponse {
-    pub deliveries: Vec<WebhookDeliveryLog>,
-    pub total_count: i64,
 }
 
 // ─── Subscribe / Unsubscribe ───────────────────────────────────────────────
@@ -163,15 +158,17 @@ pub async fn unsubscribe_from_contract(
 /// GET /api/me/subscriptions
 pub async fn list_user_subscriptions(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     auth_user: auth::AuthenticatedUser,
     Query(query): Query<ListSubscriptionsQuery>,
-) -> ApiResult<Json<UserSubscriptionsResponse>> {
+) -> ApiResult<PagedJson<ContractSubscriptionSummary>> {
     let user_id = auth_user.publisher_id;
-    let limit = query.limit.unwrap_or(20);
-    let offset = query.offset.unwrap_or(0);
+    let per_page = query.limit.unwrap_or(20).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let page = (offset / per_page) + 1;
 
-    // Use separate queries to avoid dynamic parameter numbering bugs.
-    let (subscriptions, total_count) = if let Some(ref status) = query.status {
+    let (items, total) = if let Some(ref status) = query.status {
         let rows = sqlx::query_as::<_, ContractSubscriptionSummary>(
             r#"
             SELECT cs.id, cs.contract_id, c.name AS contract_name,
@@ -186,21 +183,20 @@ pub async fn list_user_subscriptions(
         )
         .bind(user_id)
         .bind(status)
-        .bind(limit)
+        .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-        let count: i64 =
-            sqlx::query_scalar(
-                "SELECT COUNT(*) FROM contract_subscriptions WHERE user_id = $1 AND status = $2",
-            )
-            .bind(user_id)
-            .bind(status)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contract_subscriptions WHERE user_id = $1 AND status = $2",
+        )
+        .bind(user_id)
+        .bind(status)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
         (rows, count)
     } else {
@@ -217,7 +213,7 @@ pub async fn list_user_subscriptions(
             "#,
         )
         .bind(user_id)
-        .bind(limit)
+        .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await
@@ -233,10 +229,11 @@ pub async fn list_user_subscriptions(
         (rows, count)
     };
 
-    Ok(Json(UserSubscriptionsResponse {
-        subscriptions,
-        total_count,
-    }))
+    Ok(PagedJson::new(
+        PaginatedResponse::new(items, total, page, per_page),
+        &headers,
+        &uri,
+    ))
 }
 
 /// PATCH /api/subscriptions/:id
@@ -437,15 +434,18 @@ pub async fn update_notification_preferences(
 /// GET /api/notifications
 pub async fn list_notifications(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     auth_user: auth::AuthenticatedUser,
     Query(query): Query<NotificationQuery>,
-) -> ApiResult<Json<NotificationListResponse>> {
+) -> ApiResult<PagedJson<NotificationQueueItem>> {
     let user_id = auth_user.publisher_id;
-    let limit = query.limit.unwrap_or(50);
-    let offset = query.offset.unwrap_or(0);
+    let per_page = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let page = (offset / per_page) + 1;
     let unread_only = query.unread_only.unwrap_or(false);
 
-    let (notifications, total_count) = if unread_only {
+    let (items, total) = if unread_only {
         let rows = sqlx::query_as::<_, NotificationQueueItem>(
             r#"
             SELECT nq.*
@@ -457,7 +457,7 @@ pub async fn list_notifications(
             "#,
         )
         .bind(user_id)
-        .bind(limit)
+        .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await
@@ -488,7 +488,7 @@ pub async fn list_notifications(
             "#,
         )
         .bind(user_id)
-        .bind(limit)
+        .bind(per_page)
         .bind(offset)
         .fetch_all(&state.db)
         .await
@@ -509,10 +509,11 @@ pub async fn list_notifications(
         (rows, count)
     };
 
-    Ok(Json(NotificationListResponse {
-        notifications,
-        total_count,
-    }))
+    Ok(PagedJson::new(
+        PaginatedResponse::new(items, total, page, per_page),
+        &headers,
+        &uri,
+    ))
 }
 
 /// POST /api/notifications/:id/read
@@ -619,17 +620,42 @@ pub async fn get_notification_statistics(
 /// GET /api/webhooks
 pub async fn list_webhooks(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     auth_user: auth::AuthenticatedUser,
-) -> ApiResult<Json<Vec<WebhookConfiguration>>> {
+    Query(query): Query<ListWebhooksQuery>,
+) -> ApiResult<PagedJson<WebhookConfiguration>> {
+    let per_page = query.limit.unwrap_or(20).clamp(1, 100);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * per_page;
+
     let webhooks = sqlx::query_as::<_, WebhookConfiguration>(
-        "SELECT * FROM webhook_configurations WHERE user_id = $1 ORDER BY created_at DESC",
+        r#"
+        SELECT * FROM webhook_configurations
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
     )
     .bind(auth_user.publisher_id)
+    .bind(per_page)
+    .bind(offset)
     .fetch_all(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(webhooks))
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_configurations WHERE user_id = $1")
+            .bind(auth_user.publisher_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(PagedJson::new(
+        PaginatedResponse::new(webhooks, total, page, per_page),
+        &headers,
+        &uri,
+    ))
 }
 
 /// POST /api/webhooks
@@ -694,11 +720,12 @@ pub async fn delete_webhook(
 /// GET /api/webhooks/:id/deliveries
 pub async fn get_webhook_deliveries(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(webhook_id): Path<Uuid>,
     auth_user: auth::AuthenticatedUser,
     Query(query): Query<DeliveriesQuery>,
-) -> ApiResult<Json<WebhookDeliveriesResponse>> {
-    // Verify ownership.
+) -> ApiResult<PagedJson<WebhookDeliveryLog>> {
     let owned: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM webhook_configurations WHERE id = $1 AND user_id = $2)",
     )
@@ -712,8 +739,9 @@ pub async fn get_webhook_deliveries(
         return Err(ApiError::not_found("webhook", "Webhook not found"));
     }
 
-    let limit = query.limit.unwrap_or(50);
-    let offset = query.offset.unwrap_or(0);
+    let per_page = query.limit.unwrap_or(50).clamp(1, 200);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * per_page;
 
     let deliveries = sqlx::query_as::<_, WebhookDeliveryLog>(
         r#"
@@ -726,23 +754,24 @@ pub async fn get_webhook_deliveries(
         "#,
     )
     .bind(webhook_id)
-    .bind(limit)
+    .bind(per_page)
     .bind(offset)
     .fetch_all(&state.db)
     .await
     .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    let total_count: i64 =
+    let total: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM notification_delivery_logs WHERE webhook_id = $1")
             .bind(webhook_id)
             .fetch_one(&state.db)
             .await
             .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(WebhookDeliveriesResponse {
-        deliveries,
-        total_count,
-    }))
+    Ok(PagedJson::new(
+        PaginatedResponse::new(deliveries, total, page, per_page),
+        &headers,
+        &uri,
+    ))
 }
 
 /// POST /api/webhooks/:id/test  — sends a synthetic test event to the webhook.

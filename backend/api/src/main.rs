@@ -62,6 +62,7 @@ mod simulation_handlers;
 mod state;
 
 mod clone_federation_handlers;
+mod pagination;
 mod gas_estimation_handlers;
 mod security_scan_handlers;
 mod subscription_handlers;

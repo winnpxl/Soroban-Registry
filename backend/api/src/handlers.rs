@@ -3792,9 +3792,11 @@ pub async fn get_publisher(
 )]
 pub async fn get_publisher_contracts(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     Path(id): Path<String>,
     Query(query): Query<PublisherContractsQuery>,
-) -> ApiResult<Json<PaginatedResponse<Contract>>> {
+) -> ApiResult<crate::pagination::PagedJson<Contract>> {
     let publisher_uuid = Uuid::parse_str(&id).map_err(|_| {
         ApiError::bad_request(
             "InvalidPublisherId",
@@ -3802,18 +3804,15 @@ pub async fn get_publisher_contracts(
         )
     })?;
 
-    // Validate and cap limit (max 100)
     let limit = query.limit.clamp(1, 100);
     let offset = query.offset.max(0);
 
-    // Get total count
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE publisher_id = $1")
         .bind(publisher_uuid)
         .fetch_one(&state.db)
         .await
         .map_err(|err| db_internal_error("get publisher contracts count", err))?;
 
-    // Fetch paginated results
     let contracts: Vec<Contract> = sqlx::query_as(
         "SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
@@ -3825,9 +3824,9 @@ pub async fn get_publisher_contracts(
     .map_err(|err| db_internal_error("get publisher contracts", err))?;
 
     let page = (offset / limit) + 1;
-    let response = PaginatedResponse::new(contracts, total, page, limit);
+    let body = PaginatedResponse::new(contracts, total, page, limit);
 
-    Ok(Json(response))
+    Ok(crate::pagination::PagedJson::new(body, &headers, &uri))
 }
 
 /// Query for contract ABI and OpenAPI (optional version)
