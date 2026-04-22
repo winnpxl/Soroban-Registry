@@ -37,7 +37,7 @@ use shared::{
 // These types were used in handlers.rs but are now missing from the shared crate.
 // ────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AdvancedSearchRequest {
     pub query: QueryNode,
     pub limit: Option<i64>,
@@ -47,7 +47,7 @@ pub struct AdvancedSearchRequest {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum QueryNode {
     Condition(QueryCondition),
     Group {
@@ -56,22 +56,22 @@ pub enum QueryNode {
     },
 }
 
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryOperator {
     And,
     Or,
 }
 
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct QueryCondition {
     pub field: String,
     pub operator: FieldOperator,
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum FieldOperator {
     Eq,
     Ne,
@@ -6127,6 +6127,8 @@ pub async fn advanced_search_contracts(
     // Add joins for sorting/filtering if needed
     query_builder.push("LEFT JOIN contract_interactions ci ON c.id = ci.contract_id ");
     query_builder.push("LEFT JOIN contract_versions cv ON c.id = cv.contract_id ");
+    query_builder.push("LEFT JOIN contract_tags ct ON c.id = ct.contract_id ");
+    query_builder.push("LEFT JOIN tags t ON t.id = ct.tag_id ");
     query_builder.push("WHERE 1=1 ");
 
     // Recursively build the WHERE clause
@@ -6174,14 +6176,48 @@ pub async fn advanced_search_contracts(
     query_builder.push_bind(offset);
 
     let query = query_builder.build_query_as::<Contract>();
-    let contracts = query
+    let mut contracts = query
         .fetch_all(&state.db)
         .await
         .map_err(|err| db_internal_error("advanced search contracts", err))?;
 
+    // Fetch tags for these contracts (keeps output consistent with list_contracts)
+    let contract_ids: Vec<Uuid> = contracts.iter().map(|c| c.id).collect();
+    if !contract_ids.is_empty() {
+        let tag_rows = sqlx::query!(
+            r#"
+            SELECT ct.contract_id, t.id, t.name, t.color
+            FROM tags t
+            JOIN contract_tags ct ON t.id = ct.tag_id
+            WHERE ct.contract_id = ANY($1)
+            "#,
+            &contract_ids
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch tags (advanced search)", err))?;
+
+        let mut tags_map: HashMap<Uuid, Vec<shared::Tag>> = HashMap::new();
+        for row in tag_rows {
+            tags_map.entry(row.contract_id).or_default().push(shared::Tag {
+                id: row.id,
+                name: row.name,
+                color: row.color,
+            });
+        }
+
+        for contract in &mut contracts {
+            if let Some(tags) = tags_map.remove(&contract.id) {
+                contract.tags = tags;
+            }
+        }
+    }
+
     // Count total matches (naively for now, same filters)
     let mut count_builder: sqlx::QueryBuilder<'_, sqlx::Postgres> =
         sqlx::QueryBuilder::new("SELECT COUNT(DISTINCT c.id) FROM contracts c ");
+    count_builder.push("LEFT JOIN contract_tags ct ON c.id = ct.contract_id ");
+    count_builder.push("LEFT JOIN tags t ON t.id = ct.tag_id ");
     count_builder.push("WHERE 1=1 ");
     build_where_clause(&mut count_builder, &req.query)?;
 
@@ -6248,6 +6284,7 @@ fn apply_condition<'a>(
         "network" => "c.network",
         "verified" => "c.is_verified",
         "publisher" => "c.publisher_id",
+        "tag" => "t.name",
         _ => {
             return Err(ApiError::bad_request(
                 "InvalidField",
@@ -6256,42 +6293,95 @@ fn apply_condition<'a>(
         }
     };
 
+    let string_value = || {
+        cond.value.as_str().ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidValue",
+                format!(
+                    "Field '{}' expects a string value for operator '{:?}'",
+                    cond.field, cond.operator
+                ),
+            )
+        })
+    };
+
     builder.push(field);
     match cond.operator {
         FieldOperator::Eq => {
             builder.push(" = ");
-            builder.push_bind(cond.value.as_str().unwrap_or_default());
+            if cond.field == "verified" {
+                let value = cond.value.as_bool().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "InvalidValue",
+                        "Field 'verified' expects a boolean value",
+                    )
+                })?;
+                builder.push_bind(value);
+            } else {
+                builder.push_bind(string_value()?);
+            }
         }
         FieldOperator::Ne => {
             builder.push(" != ");
-            builder.push_bind(cond.value.as_str().unwrap_or_default());
+            if cond.field == "verified" {
+                let value = cond.value.as_bool().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "InvalidValue",
+                        "Field 'verified' expects a boolean value",
+                    )
+                })?;
+                builder.push_bind(value);
+            } else {
+                builder.push_bind(string_value()?);
+            }
         }
         FieldOperator::Gt => {
             builder.push(" > ");
-            builder.push_bind(cond.value.as_str().unwrap_or_default());
+            builder.push_bind(string_value()?);
         }
         FieldOperator::Lt => {
             builder.push(" < ");
-            builder.push_bind(cond.value.as_str().unwrap_or_default());
+            builder.push_bind(string_value()?);
         }
         FieldOperator::In => {
             builder.push(" IN (");
-            if let Some(arr) = cond.value.as_array() {
-                let mut separated = builder.separated(", ");
-                for val in arr {
-                    separated.push_bind(val.as_str().unwrap_or_default().to_string());
+            let arr = cond.value.as_array().ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidValue",
+                    format!("Field '{}' expects an array value for operator 'in'", cond.field),
+                )
+            })?;
+
+            let mut separated = builder.separated(", ");
+            for val in arr {
+                if cond.field == "verified" {
+                    let b = val.as_bool().ok_or_else(|| {
+                        ApiError::bad_request(
+                            "InvalidValue",
+                            "Field 'verified' expects a boolean array value",
+                        )
+                    })?;
+                    separated.push_bind(b);
+                } else {
+                    let s = val.as_str().ok_or_else(|| {
+                        ApiError::bad_request(
+                            "InvalidValue",
+                            format!("Field '{}' expects a string array value", cond.field),
+                        )
+                    })?;
+                    separated.push_bind(s.to_string());
                 }
             }
             builder.push(")");
         }
         FieldOperator::Contains => {
             builder.push(" ILIKE ");
-            let val = format!("%{}%", cond.value.as_str().unwrap_or_default());
+            let val = format!("%{}%", string_value()?);
             builder.push_bind(val);
         }
         FieldOperator::StartsWith => {
             builder.push(" ILIKE ");
-            let val = format!("{}%", cond.value.as_str().unwrap_or_default());
+            let val = format!("{}%", string_value()?);
             builder.push_bind(val);
         }
     }
