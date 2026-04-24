@@ -154,7 +154,10 @@ Access the web application at `http://localhost:3000` to:
 cargo install --path cli
 
 # Search for contracts
-soroban-registry search "token"
+soroban-registry search "token" --category defi --verified-only --network testnet,futurenet
+
+# Search and get JSON output
+soroban-registry search "factory" --json > results.json
 
 # Get contract details
 soroban-registry info <contract-id>
