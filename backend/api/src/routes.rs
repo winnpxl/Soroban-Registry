@@ -4,7 +4,7 @@ use crate::{
     ab_test_handlers, analytics_handlers, auth, auth_handlers, batch_verify_handlers,
     breaking_changes, canary_handlers, category_handlers, clone_federation_handlers,
     compatibility_testing_handlers, contract_events, custom_metrics_handlers,
-    deprecation_handlers, handlers, interoperability_handlers, metrics_handler,
+    deprecation_handlers, favorites_handlers, handlers, interoperability_handlers, metrics_handler,
     migration_handlers, org_handlers, performance_handlers, resource_handlers,
     security_scan_handlers, similarity_handlers, simulation_handlers, state::AppState,
     subscription_handlers, websocket,
@@ -758,5 +758,11 @@ pub fn subscription_routes() -> Router<AppState> {
         .route(
             "/api/webhooks/:id",
             delete(subscription_handlers::delete_webhook),
+        )
+        // Favorites preferences
+        .route(
+            "/api/me/preferences",
+            get(favorites_handlers::get_favorites)
+                .patch(favorites_handlers::update_favorites),
         )
 }

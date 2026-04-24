@@ -5,6 +5,7 @@ import { ReactNode, useState } from 'react';
 import { ThemeProvider } from '@/providers/ThemeProvider';
 import ToastProvider from '@/providers/ToastProvider';
 import RealtimeProvider from '@/providers/RealtimeProvider';
+import FavoritesProvider from '@/providers/FavoritesProvider';
 import ErrorBoundary from './ErrorBoundary';
 
 export default function Providers({ children }: { children: ReactNode }) {
@@ -26,7 +27,9 @@ export default function Providers({ children }: { children: ReactNode }) {
         <ThemeProvider>
           <RealtimeProvider>
             <ToastProvider>
-              {children}
+              <FavoritesProvider>
+                {children}
+              </FavoritesProvider>
             </ToastProvider>
           </RealtimeProvider>
         </ThemeProvider>

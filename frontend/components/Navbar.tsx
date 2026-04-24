@@ -1,11 +1,12 @@
 'use client';
 
-import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus, Columns2, ShieldCheck, PieChart, TrendingUp, LogOut, Settings, Zap, Code2, User } from 'lucide-react';
+import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus, Columns2, ShieldCheck, PieChart, TrendingUp, LogOut, Settings, Zap, Code2, User, Star } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ThemeToggle from './ThemeToggle';
 import NotificationBell from './NotificationBell';
+import { useFavorites } from '@/hooks/useFavorites';
 
 /* ─── nav links ──────────────────────────────────────────── */
 const NAV_LINKS = [
@@ -179,6 +180,7 @@ function SearchModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void
 export default function Navbar() {
     const pathname = usePathname() ?? '';
     const scrolled = useScrolled();
+    const { favoritesCount } = useFavorites();
 
     const [mobileOpen,    setMobileOpen]    = useState(false);
     const [exploreOpen,   setExploreOpen]   = useState(false);
@@ -346,6 +348,24 @@ export default function Navbar() {
 
                             <ThemeToggle />
                             <NotificationBell />
+
+                            {/* Favorites link */}
+                            <Link
+                                href="/favorites"
+                                aria-label="Your favorites"
+                                className={`relative p-1.5 rounded-md transition-colors ${
+                                    isActive('/favorites')
+                                        ? 'text-primary bg-primary/10'
+                                        : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                                }`}
+                            >
+                                <Star className="w-5 h-5" />
+                                {favoritesCount > 0 && (
+                                    <span className="absolute top-0.5 right-0.5 flex items-center justify-center min-w-[1rem] h-4 px-0.5 text-[10px] font-bold text-primary-foreground bg-primary rounded-full">
+                                        {favoritesCount > 99 ? '99+' : favoritesCount}
+                                    </span>
+                                )}
+                            </Link>
 
                             {/* Profile dropdown */}
                             <div
@@ -520,6 +540,7 @@ export default function Navbar() {
                                 { href: '/templates', label: 'Templates', icon: Layers },
                                 { href: '/analytics', label: 'Search Analytics', icon: TrendingUp },
                                 { href: '/graph', label: 'Dependency Graph', icon: GitBranch },
+                                { href: '/favorites', label: 'My Favorites', icon: Star },
                             ].map(({ href, label, icon: Icon }) => (
                                 <Link
                                     key={href}
