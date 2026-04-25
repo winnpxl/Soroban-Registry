@@ -30,6 +30,18 @@ pub fn auth_routes() -> Router<AppState> {
         .route("/api/auth/verify", post(auth_handlers::verify_challenge))
 }
 
+pub fn plugin_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/plugins/marketplace",
+            get(plugin_marketplace_handlers::get_marketplace),
+        )
+        .route(
+            "/api/plugins/:name/:version",
+            get(plugin_marketplace_handlers::get_plugin_manifest),
+        )
+}
+
 pub fn contract_routes() -> Router<AppState> {
     Router::new()
         .route("/ws/contracts", get(contract_events::contracts_websocket))
