@@ -62,9 +62,17 @@ mod similarity_handlers;
 mod simulation;
 mod simulation_handlers;
 mod state;
-mod publisher_verification_handlers; // Issue #603
+
+mod clone_federation_handlers;
+mod formal_verification;
+mod formal_verification_handlers;
+mod pagination;
+mod gas_estimation_handlers;
+mod security_scan_handlers;
+mod subscription_handlers;
 mod type_safety;
 mod validation;
+mod webhook_delivery;
 mod websocket;
 mod zk_proof_handlers;
 
@@ -194,6 +202,9 @@ async fn main() -> Result<()> {
     // Initialize GraphQL schema
     let schema = graphql::schema::build_schema(state.clone());
 
+    // Spawn webhook delivery background task
+    webhook_delivery::spawn_webhook_delivery_task(pool.clone());
+
     // Spawn the background DB and cache monitoring task
     db_monitoring::spawn_db_monitoring_task(pool.clone(), state.cache.clone());
 
@@ -276,6 +287,8 @@ async fn main() -> Result<()> {
         .merge(multisig_routes::routes())
         .merge(routes::observability_routes())
         .merge(routes::websocket_routes())
+        .merge(routes::subscription_routes())
+        .merge(routes::formal_verification_routes())
         .merge(routes::validator_routes())
         .merge(release_notes_routes::release_notes_routes())
         .route(

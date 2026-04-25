@@ -1134,9 +1134,15 @@ pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
     pub total: i64,
     pub page: i64,
+    /// Number of items per page (serialised as `per_page`).
+    #[serde(rename = "per_page")]
     pub page_size: i64,
+    /// Total number of pages (serialised as `pages`).
+    #[serde(rename = "pages")]
     pub total_pages: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_cursor: Option<String>,
 }
 
