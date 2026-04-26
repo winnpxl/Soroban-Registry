@@ -1476,6 +1476,22 @@ pub async fn list_contracts(
         Err(err) => return map_query_rejection(err).into_response(),
     };
 
+    let cache_key = match serde_json::to_string(&params) {
+        Ok(json) => {
+            let sub = claims.as_ref().map(|c| c.sub.as_str()).unwrap_or("public");
+            format!("contracts:list:{}:{}", sub, json)
+        }
+        Err(_) => String::new(),
+    };
+
+    if !cache_key.is_empty() {
+        if let Some(cached) = state.cache.get_contracts(&cache_key).await {
+            if let Ok(response) = serde_json::from_str::<PaginatedResponse<Contract>>(&cached) {
+                return Json(response).into_response();
+            }
+        }
+    }
+
     let (limit, offset, page) = match validate_contract_list_pagination(&params) {
         Ok(values) => values,
         Err(err) => return err.into_response(),
@@ -1685,6 +1701,8 @@ fn csv_escape(value: &str) -> String {
     } else {
         value.to_string()
     }
+
+    Json(response).into_response()
 }
 
 fn optional_json_string(value: &Option<serde_json::Value>) -> String {
@@ -2765,6 +2783,7 @@ pub async fn revert_contract_version(
 
     state.cache.invalidate_abi(&contract_id).await;
     state.cache.invalidate_abi(&contract_uuid.to_string()).await;
+    state.cache.invalidate_contracts().await;
 
     Ok(Json(version_row))
 }
@@ -3563,6 +3582,7 @@ pub async fn create_contract_version(
                 &version_row,
             ));
     }
+    state.cache.invalidate_contracts().await;
 
     Ok(Json(version_row))
 }
@@ -3845,6 +3865,7 @@ pub async fn publish_contract(
         );
     }
 
+    state.cache.invalidate_contracts().await;
     Ok(Json(contract))
 }
 
@@ -4943,6 +4964,7 @@ pub async fn update_contract_metadata(
             ));
     }
 
+    state.cache.invalidate_contracts().await;
     Ok(Json(after))
 }
 
@@ -5040,6 +5062,7 @@ pub async fn change_contract_publisher(
         .map_err(|err| db_internal_error("write publisher_changed audit log", err))?;
     }
 
+    state.cache.invalidate_contracts().await;
     Ok(Json(after))
 }
 
@@ -5224,6 +5247,7 @@ pub async fn update_contract_status(
             ));
     }
 
+    state.cache.invalidate_contracts().await;
     Ok(Json(json!({
         "contract_id": contract_uuid,
         "verification_id": verification_id,
@@ -5334,6 +5358,7 @@ pub async fn bulk_update_contract_status(
         .await
         .map_err(|e| db_internal_error("commit bulk status update", e))?;
 
+    state.cache.invalidate_contracts().await;
     Ok(Json(json!({ "results": results })))
 }
 
