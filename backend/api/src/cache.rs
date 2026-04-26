@@ -1,10 +1,9 @@
 use moka::future::Cache as MokaCache;
 use redis::aio::ConnectionManager;
+use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-use redis::aio::ConnectionManager;
-
 
 /// Cache configuration options
 #[derive(Clone, Debug)]
@@ -23,7 +22,7 @@ impl Default for CacheConfig {
             max_capacity: 10_000,
             redis_enabled: false,
             redis_url: None,
-            contracts_ttl: 300, // 5 minutes
+            contracts_ttl: 300,
         }
     }
 }
@@ -46,8 +45,8 @@ impl CacheConfig {
             config.redis_enabled = redis_enabled_str.to_lowercase() == "true";
         }
 
-        if let Ok(contracts_ttl_str) = std::env::var("CONTRACTS_CACHE_TTL") {
-            if let Ok(ttl) = contracts_ttl_str.parse::<u64>() {
+        if let Ok(ttl_str) = std::env::var("CONTRACTS_CACHE_TTL") {
+            if let Ok(ttl) = ttl_str.parse::<u64>() {
                 config.contracts_ttl = ttl;
             }
         }
@@ -142,7 +141,6 @@ impl CacheLayer {
             config,
         }
     }
-
 
     pub fn config(&self) -> &CacheConfig {
         &self.config
@@ -273,14 +271,7 @@ impl CacheLayer {
         if !self.config.enabled {
             return None;
         }
-
-        let result = self.contracts_cache.get(key).await;
-        if result.is_some() {
-            crate::metrics::CONTRACTS_CACHE_HITS.inc();
-        } else {
-            crate::metrics::CONTRACTS_CACHE_MISSES.inc();
-        }
-        result
+        self.contracts_cache.get(key).await
     }
 
     pub async fn put_contracts(&self, key: String, value: String) {
