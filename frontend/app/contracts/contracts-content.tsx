@@ -154,11 +154,11 @@ export function getInitialFilters(searchParams: URLSearchParams): ContractsUiFil
       network === 'mainnet' || network === 'testnet' || network === 'futurenet',
   );
 
-  const sortBy = searchParams.get('sort_by') as SortBy;
-  const sortOrder = searchParams.get('sort_order') as 'asc' | 'desc';
+  const sortPreference = resolveInitialSortPreference(
+    searchParams,
+    typeof window !== 'undefined' ? window.localStorage : undefined,
+  );
   const parsedPage = Number(searchParams.get('page') || '1');
-
-  const validSortBys: SortBy[] = ['name', 'created_at', 'updated_at', 'popularity', 'deployments', 'interactions', 'relevance', 'downloads'];
 
   return {
     query,
