@@ -75,6 +75,7 @@ mod gas_estimation_handlers;
 mod security_scan_handlers;
 mod subscription_handlers;
 mod type_safety;
+mod usage_counter;
 mod validation;
 mod webhook_delivery;
 mod websocket;
