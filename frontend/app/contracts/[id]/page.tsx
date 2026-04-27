@@ -402,8 +402,8 @@ function ContractDetailsContent() {
                   type="button"
                   onClick={() => setSelectedNetwork(net)}
                   className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-all ${selectedNetwork === net
-                      ? "bg-card text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
                     } ${!hasConfig ? "opacity-60" : ""}`}
                 >
                   {net}
@@ -479,8 +479,8 @@ function ContractDetailsContent() {
                   setTabSearch("");
                 }}
                 className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition-colors ${activeTab === tabId
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground hover:bg-accent"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:text-foreground hover:bg-accent"
                   }`}
               >
                 <Icon className="w-4 h-4" />

@@ -1,3 +1,6 @@
+pub mod ab_test_handlers;
+pub mod aggregation;
+pub mod analytics;
 pub mod auth;
 pub mod ab_test_handlers;
 pub mod analytics_handlers;

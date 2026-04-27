@@ -51,7 +51,6 @@ pub fn plugin_routes() -> Router<AppState> {
 
 pub fn contract_routes() -> Router<AppState> {
     Router::new()
-        .route("/ws/contracts", get(contract_events::contracts_websocket))
         .route(
             "/api/contracts",
             get(handlers::list_contracts).post(handlers::publish_contract),
@@ -949,5 +948,25 @@ pub fn zk_proof_routes() -> Router<AppState> {
         .route(
             "/api/contracts/:id/zk/analytics",
             get(zk_proof_handlers::get_zk_analytics),
+        )
+}
+
+pub fn collaborative_review_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/reviews/collaborative",
+            post(collaborative_reviews::create_collaborative_review),
+        )
+        .route(
+            "/api/reviews/collaborative/:id",
+            get(collaborative_reviews::get_collaborative_review),
+        )
+        .route(
+            "/api/reviews/collaborative/:id/comment",
+            post(collaborative_reviews::add_collaborative_comment),
+        )
+        .route(
+            "/api/reviews/collaborative/:id/status",
+            patch(collaborative_reviews::update_reviewer_status),
         )
 }

@@ -15,8 +15,21 @@ use std::time::Instant;
 use crate::SearchClient;
 
 use tokio::sync::broadcast;
+use shared::models::Network;
+use shared::source_storage::SourceStorage;
+use crate::error::ApiError;
+use crate::contract_events::ContractEventHub;
+use serde_json::Value;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractEventVisibility {
+    Public,
+    Private,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "camelCase")]
 pub enum RealtimeEvent {
     ContractDeployed {
         contract_id: String,
@@ -24,11 +37,12 @@ pub enum RealtimeEvent {
         publisher: String,
         version: String,
         timestamp: String,
+        network: Network,
     },
     ContractUpdated {
         contract_id: String,
         update_type: String,
-        details: serde_json::Value,
+        details: Value,
         timestamp: String,
     },
     CicdPipeline {
@@ -37,6 +51,26 @@ pub enum RealtimeEvent {
         steps_completed: u32,
         total_steps: u32,
         timestamp: String,
+    },
+    VersionCreated {
+        contract_id: String,
+        version: String,
+        network: Network,
+        timestamp: String,
+    },
+    MetadataUpdated {
+        contract_id: String,
+        timestamp: String,
+        changes: Value,
+        visibility: ContractEventVisibility,
+    },
+    StatusUpdated {
+        contract_id: String,
+        status: String,
+        timestamp: String,
+        is_verified: bool,
+        details: Option<Value>,
+        visibility: ContractEventVisibility,
     },
 }
 

@@ -9,6 +9,7 @@ mod batch_verify_handlers;
 mod breaking_changes;
 mod cache;
 mod canary_handlers;
+mod collaborative_reviews;
 mod compatibility_testing_handlers;
 mod contract_events;
 mod contributor_handlers;
@@ -107,15 +108,12 @@ async fn track_in_flight_middleware(
             "Service is shutting down and temporarily unavailable",
         ));
     }
-    crate::metrics::HTTP_IN_FLIGHT.inc();
+    api::metrics::HTTP_IN_FLIGHT.inc();
     let res = next.run(req).await;
-    crate::metrics::HTTP_IN_FLIGHT.dec();
+    api::metrics::HTTP_IN_FLIGHT.dec();
     Ok(res)
 }
 
-use crate::error::ApiError;
-use crate::rate_limit::RateLimitState;
-use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -171,7 +169,7 @@ async fn main() -> Result<()> {
 
     // Create prometheus registry for metrics
     let registry = Registry::new();
-    if let Err(e) = crate::metrics::register_all(&registry) {
+    if let Err(e) = api::metrics::register_all(&registry) {
         tracing::error!("Failed to register metrics: {}", e);
     }
 
@@ -278,6 +276,7 @@ async fn main() -> Result<()> {
         .merge(routes::federation_routes())
         .merge(routes::mutation_testing_routes()) // Issue #619
         .merge(multisig_routes::routes())
+        .merge(routes::collaborative_review_routes())
         .merge(routes::observability_routes())
         .merge(routes::websocket_routes())
         .merge(routes::subscription_routes())
