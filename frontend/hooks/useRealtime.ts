@@ -5,10 +5,20 @@ import { RealtimeContext } from '@/providers/RealtimeProvider';
 
 export function useRealtime() {
   const context = useContext(RealtimeContext);
-  
+
+  // Fallback for SSR or when provider is not available
+  const fallback = {
+    isConnected: false,
+    unreadCount: 0,
+    notifications: [],
+    subscribe: () => () => {},
+    clearNotifications: () => {},
+    markAsRead: () => {},
+  };
+
   if (!context) {
-    throw new Error('useRealtime must be used within a RealtimeProvider');
+    return fallback;
   }
-  
+
   return context;
 }

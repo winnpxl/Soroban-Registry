@@ -1,13 +1,19 @@
 use crate::auth::AuthManager;
 use crate::cache::{CacheConfig, CacheLayer};
+use crate::contract_events::ContractEventHub;
 use crate::health_monitor::HealthMonitorStatus;
+use crate::rate_limit::RateLimitState;
 use crate::resource_tracking::ResourceManager;
+use shared::source_storage::SourceStorage;
+
 use prometheus::Registry;
-use shared::error::RegistryError;
 use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use crate::SearchClient;
+
 use tokio::sync::broadcast;
 use shared::models::Network;
 use shared::source_storage::SourceStorage;
@@ -83,6 +89,8 @@ pub struct AppState {
     pub resource_mgr: Arc<RwLock<ResourceManager>>,
     pub source_storage: Arc<SourceStorage>,
     pub event_broadcaster: broadcast::Sender<RealtimeEvent>,
+    /// Rate limiter reference — used by the /api/quota endpoint (issue #727).
+    pub rate_limit_state: Arc<RateLimitState>,
 }
 
 impl AppState {
@@ -91,15 +99,32 @@ impl AppState {
         registry: Registry,
         job_engine: Arc<soroban_batch::engine::JobEngine>,
         is_shutting_down: Arc<AtomicBool>,
+        rate_limit_state: Arc<RateLimitState>,
     ) -> Result<Self, shared::error::RegistryError> {
         let config = CacheConfig::from_env();
-        let auth_mgr = Arc::new(RwLock::new(
-            AuthManager::from_env().expect("JWT config validated at startup"),
-        ));
+        let auth_manager = match AuthManager::from_env() {
+            Ok(manager) => manager,
+            Err(err) => {
+                #[cfg(test)]
+                {
+                    let _ = err;
+                    // Keep tests deterministic when JWT_SECRET is not set in local environments.
+                    AuthManager::new("test-jwt-secret-at-least-32-chars".to_string())
+                }
+                #[cfg(not(test))]
+                {
+                    panic!("JWT config validated at startup: {:?}", err)
+                }
+            }
+        };
+        let auth_mgr = Arc::new(RwLock::new(auth_manager));
         let resource_mgr = Arc::new(RwLock::new(ResourceManager::new()));
         let contract_events = Arc::new(ContractEventHub::from_env());
         let source_storage = Arc::new(SourceStorage::new().await?);
         let (event_broadcaster, _) = broadcast::channel(100);
+        let elasticsearch_url = std::env::var("ELASTICSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
+        let search = Arc::new(SearchClient::new(&elasticsearch_url).expect("Search client init"));
+
         Ok(Self {
             db,
             started_at: Instant::now(),
@@ -113,7 +138,7 @@ impl AppState {
             resource_mgr,
             source_storage,
             event_broadcaster,
-        }
+            rate_limit_state,
         })
     }
 }

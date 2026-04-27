@@ -1,26 +1,33 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { api, ContractSearchParams, Contract } from '@/lib/api';
+import { useQuery } from '@tanstack/react-query';
+import { api, ContractSearchParams, Contract, SemanticContractSearchResponse } from '@/lib/api';
 import ContractCard from '@/components/ContractCard';
 import ContractCardSkeleton from '@/components/ContractCardSkeleton';
 import { ActiveFilters } from '@/components/contracts/ActiveFilters';
 import { FilterPanel } from '@/components/contracts/FilterPanel';
 import { ResultsCount } from '@/components/contracts/ResultsCount';
-import { SearchBar } from '@/components/contracts/SearchBar';
-import { SortDropdown, SortBy } from '@/components/contracts/SortDropdown';
+import { SortDropdown } from '@/components/contracts/SortDropdown';
 import TagAutocomplete from '@/components/tags/TagAutocomplete';
 import { Filter, Package, SlidersHorizontal, X, Sparkles, CheckCircle, Users } from 'lucide-react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useAnalytics } from '@/hooks/useAnalytics';
 import QueryBuilder from '@/components/contracts/QueryBuilder';
 import FavoriteSearches from '@/components/contracts/FavoriteSearches';
-import { useSearchUrlSync } from '@/hooks/useSearchUrlSync';
-import { QueryNode } from '@/lib/api';
+import {
+  DEFAULT_SORT_PREFERENCE,
+  persistSortPreference,
+  resolveInitialSortPreference,
+  type SortBy,
+} from './sort-utils';
+import {
+  combineAdvancedQueryWithFilters,
+  parseAdvancedContractQuery,
+} from '@/utils/advancedSearchSyntax';
 
 const DEFAULT_PAGE_SIZE = 12;
-const CATEGORY_OPTIONS = [
+const CATEGORY_OPTIONS_NAMES = [
   'DeFi',
   'NFT',
   'Governance',
@@ -110,7 +117,13 @@ function getPaginationRange(
   return range;
 }
 
-type ContractsUiFilters = {
+type FilterOption = {
+  value: string;
+  label: string;
+  count: number;
+};
+
+export type ContractsUiFilters = {
   query: string;
   categories: string[];
   languages: string[];
@@ -134,7 +147,10 @@ const EMPTY_CONTRACTS_RESPONSE: ContractsResponse = {
   total_pages: 1,
 };
 
-function getInitialFilters(searchParams: URLSearchParams): ContractsUiFilters {
+const DEFAULT_SORT_BY: SortBy = DEFAULT_SORT_PREFERENCE.sort_by;
+const DEFAULT_SORT_ORDER: ContractsUiFilters['sort_order'] = DEFAULT_SORT_PREFERENCE.sort_order;
+
+export function getInitialFilters(searchParams: URLSearchParams): ContractsUiFilters {
   const query = searchParams.get('query') || searchParams.get('q') || '';
   const categories = parseCsvOrMulti(searchParams.getAll('category'));
   const languages = parseCsvOrMulti(searchParams.getAll('language'));
@@ -144,11 +160,11 @@ function getInitialFilters(searchParams: URLSearchParams): ContractsUiFilters {
       network === 'mainnet' || network === 'testnet' || network === 'futurenet',
   );
 
-  const sortBy = searchParams.get('sort_by') as SortBy;
-  const sortOrder = searchParams.get('sort_order') as 'asc' | 'desc';
+  const sortPreference = resolveInitialSortPreference(
+    searchParams,
+    typeof window !== 'undefined' ? window.localStorage : undefined,
+  );
   const parsedPage = Number(searchParams.get('page') || '1');
-
-  const validSortBys: SortBy[] = ['name', 'created_at', 'updated_at', 'popularity', 'deployments', 'interactions', 'relevance', 'downloads'];
 
   return {
     query,
@@ -158,11 +174,50 @@ function getInitialFilters(searchParams: URLSearchParams): ContractsUiFilters {
     author: searchParams.get('author') || '',
     networks,
     verified_only: searchParams.get('verified_only') === 'true',
-    sort_by: validSortBys.includes(sortBy) ? sortBy : (query ? 'relevance' : 'created_at'),
-    sort_order: sortOrder === 'asc' || sortOrder === 'desc' ? sortOrder : 'desc',
+    sort_by: sortPreference.sort_by,
+    sort_order: sortPreference.sort_order,
     page: Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1,
     page_size: DEFAULT_PAGE_SIZE,
   };
+}
+
+export function buildContractsApiParams(filters: ContractsUiFilters): ContractSearchParams {
+  return {
+    query: filters.query || undefined,
+    categories: filters.categories.length > 0 ? filters.categories : undefined,
+    languages: filters.languages.length > 0 ? filters.languages : undefined,
+    tags: filters.tags.length > 0 ? filters.tags : undefined,
+    networks:
+      filters.networks.length > 0
+        ? (filters.networks as Array<'mainnet' | 'testnet' | 'futurenet'>)
+        : undefined,
+    author: filters.author || undefined,
+    verified_only: filters.verified_only || undefined,
+    sort_by: filters.sort_by,
+    sort_order: filters.sort_order,
+    page: filters.page,
+    page_size: filters.page_size,
+  };
+}
+
+function getOptionCounts(
+  items: Contract[] | undefined,
+  options: readonly string[],
+  getValue: (contract: Contract) => string | undefined,
+): FilterOption[] {
+  const counts = new Map<string, number>();
+
+  items?.forEach((item) => {
+    const value = getValue(item);
+    if (!value) return;
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  });
+
+  return options.map((option) => ({
+    value: option,
+    label: option.charAt(0).toUpperCase() + option.slice(1),
+    count: counts.get(option) ?? 0,
+  }));
 }
 
 export function ContractsContent() {
@@ -178,132 +233,115 @@ export function ContractsContent() {
     getInitialFilters(new URLSearchParams(searchParams?.toString() ?? '')),
   );
 
-  const [isAdvancedSearch, setIsAdvancedSearch] = useState(false);
-  const [advancedQuery, setAdvancedQuery] = useState<QueryNode | null>(null);
-
   const { query, categories, languages, tags, networks, author, verified_only, sort_by, sort_order, page, page_size } = filters;
 
-  const apiParams = useMemo((): ContractSearchParams => {
-    if (isAdvancedSearch && advancedQuery) {
-      return {
-        query: JSON.stringify(advancedQuery),
-        page,
-        page_size,
-        sort_by,
-        sort_order,
-      };
-    }
-    return {
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (query) params.set('query', query);
+    categories.forEach((category) => params.append('category', category));
+    languages.forEach((language) => params.append('language', language));
+    tags.forEach((tag) => params.append('tag', tag));
+    networks.forEach((network) => params.append('network', network));
+    if (author) params.set('author', author);
+    if (verified_only) params.set('verified_only', 'true');
+    if (sort_by !== DEFAULT_SORT_BY || query) params.set('sort_by', sort_by);
+    if (sort_order !== DEFAULT_SORT_ORDER) params.set('sort_order', sort_order);
+    if (page > 1) params.set('page', String(page));
+    if (page_size !== DEFAULT_PAGE_SIZE) params.set('page_size', String(page_size));
+
+    const next = params.toString();
+    router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false });
+  }, [query, categories, languages, tags, networks, author, verified_only, sort_by, sort_order, page, page_size, pathname, router]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    persistSortPreference(
+      { sort_by: filters.sort_by, sort_order: filters.sort_order },
+      window.localStorage,
+    );
+  }, [filters.sort_by, filters.sort_order]);
+
+  const parsedQuery = useMemo(() => parseAdvancedContractQuery(query), [query]);
+  const useAdvancedSearch = Boolean(query.trim()) && parsedQuery.usesOr && Boolean(parsedQuery.queryNode);
+
+  const contractsQueryKey = useMemo(
+    () => ({
+      mode: useAdvancedSearch ? 'advanced' : 'simple',
       query,
       categories,
       languages,
+      tags,
       networks,
-      author: author || undefined,
+      author,
       verified_only,
       sort_by,
       sort_order,
       page,
       page_size,
-    };
-  }, [isAdvancedSearch, advancedQuery, query, categories, languages, networks, author, verified_only, sort_by, sort_order, page, page_size]);
+    }),
+    [
+      author,
+      categories,
+      languages,
+      networks,
+      page,
+      page_size,
+      query,
+      sort_by,
+      sort_order,
+      tags,
+      useAdvancedSearch,
+      verified_only,
+    ],
+  );
 
-  const { syncToUrl } = useSearchUrlSync(advancedQuery, setAdvancedQuery);
+  const { data: effectiveData, isLoading, isFetching } = useQuery<ContractsResponse>({
+    queryKey: ['contracts', contractsQueryKey],
+    queryFn: async () => {
+      if (useAdvancedSearch && parsedQuery.queryNode) {
+        const combined = combineAdvancedQueryWithFilters(parsedQuery.queryNode, {
+          categories,
+          networks: networks.length > 0 ? (networks as Array<'mainnet' | 'testnet' | 'futurenet'>) : undefined,
+          tags,
+          author,
+          verified_only,
+        });
 
-  const { data: allContracts, isLoading, isFetching, refetch } = useQuery<Awaited<ReturnType<typeof api.getContracts>>>({
-    queryKey: ['contracts', apiParams],
-    queryFn: () => api.getContracts(apiParams),
+        return api.advancedSearchContracts({
+          query: combined,
+          sort_by,
+          sort_order,
+          limit: page_size,
+          offset: (page - 1) * page_size,
+        });
+      }
+
+      return api.getContracts({
+        query,
+        categories: categories.length > 0 ? categories : undefined,
+        languages: languages.length > 0 ? languages : undefined,
+        tags: tags.length > 0 ? tags : undefined,
+        networks: networks.length > 0 ? (networks as Array<'mainnet' | 'testnet' | 'futurenet'>) : undefined,
+        author: author || undefined,
+        verified_only: verified_only || undefined,
+        sort_by,
+        sort_order,
+        page,
+        page_size,
+      });
+    },
     placeholderData: (previousData) => previousData ?? EMPTY_CONTRACTS_RESPONSE,
   });
-
-  const effectiveData = useMemo(() => {
-    const all = allContracts?.items ?? [];
-
-    let filtered = all;
-
-    // Filter by query if present
-    if (filters.query) {
-      const q = filters.query.toLowerCase();
-      filtered = filtered.filter(
-        (c) =>
-          c.name.toLowerCase().includes(q) ||
-          (c.description && c.description.toLowerCase().includes(q)) ||
-          (c.tags && Array.isArray(c.tags) && c.tags.some((t) => t.toLowerCase().includes(q))),
-      );
-    }
-
-    if (filters.networks.length > 0) {
-      filtered = filtered.filter((c) => filters.networks.includes(c.network as never));
-    }
-
-    if (filters.categories.length > 0) {
-      filtered = filtered.filter((c) => c.category && filters.categories.includes(c.category));
-    }
-
-    if (filters.languages.length > 0) {
-      const langs = filters.languages.map((l) => l.toLowerCase());
-      filtered = filtered.filter((c) =>
-        c.tags && Array.isArray(c.tags) && c.tags.some((t) => langs.includes(t.toLowerCase())),
-      );
-    }
-
-    if (filters.tags.length > 0) {
-      filtered = filtered.filter((c) =>
-        filters.tags.every((tag) => c.tags && Array.isArray(c.tags) && c.tags.includes(tag)),
-      );
-    }
-
-    if (filters.author) {
-      const author = filters.author.toLowerCase();
-      filtered = filtered.filter((c) =>
-        c.publisher_id.toLowerCase().includes(author),
-      );
-    }
-
-    if (filters.verified_only) {
-      filtered = filtered.filter((c) => c.is_verified);
-    }
-
-    // Sort
-    const order = filters.sort_order === 'asc' ? 1 : -1;
-    filtered = [...filtered].sort((a, b) => {
-      switch (filters.sort_by) {
-        case 'name':
-          return order * a.name.localeCompare(b.name);
-        case 'popularity':
-          return order * ((a.popularity_score ?? 0) - (b.popularity_score ?? 0));
-        case 'updated_at':
-          return order * (new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime());
-        default:
-          return order * (new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-      }
-    });
-
-    // Paginate
-    const total = filtered.length;
-    const total_pages = Math.max(1, Math.ceil(total / filters.page_size));
-    const start = (filters.page - 1) * filters.page_size;
-    const items = filtered.slice(start, start + filters.page_size);
-
-    return { items, total, page: filters.page, page_size: filters.page_size, total_pages };
-  }, [allContracts, filters]);
-
-  const { mutate: saveFavorite } = useMutation({
-    mutationFn: (name: string) => api.saveFavoriteSearch({ name, query: advancedQuery! }),
-    onSuccess: () => {
-      alert('Search saved to favorites');
-    },
-  });
-
-  const saveFavoriteMutation = { mutate: saveFavorite };
 
   const { data: stats } = useQuery({
     queryKey: ['stats'],
     queryFn: () => api.getStats(),
   });
 
+  // Used to determine if results are empty for UI
   const paginationRange = useMemo(
     () => (effectiveData ? getPaginationRange(filters.page, effectiveData.total_pages) : []),
-    [filters.page, effectiveData],
+    [filters.page, effectiveData?.total_pages],
   );
 
   useEffect(() => {
@@ -326,7 +364,7 @@ export function ContractsContent() {
       payload.networks.length > 0 ||
       Boolean(payload.author) ||
       payload.verified_only ||
-      payload.sort_by !== 'created_at' ||
+      payload.sort_by !== DEFAULT_SORT_BY ||
       payload.page > 1;
 
     if (!hasSearchInput) return;
@@ -348,8 +386,8 @@ export function ContractsContent() {
       author: '',
       networks: [],
       verified_only: false,
-      sort_by: 'created_at',
-      sort_order: 'desc',
+      sort_by: DEFAULT_SORT_BY,
+      sort_order: DEFAULT_SORT_ORDER,
       page: 1,
     }));
 
@@ -433,56 +471,69 @@ export function ContractsContent() {
       });
     }
 
-    if (filters.sort_by !== 'created_at' || filters.sort_order !== 'desc') {
+    if (filters.sort_by !== DEFAULT_SORT_BY || filters.sort_order !== DEFAULT_SORT_ORDER) {
       chips.push({
         id: 'sort',
         label: `Sort: ${filters.sort_by.replace('_', ' ')} (${filters.sort_order})`,
-        onRemove: () => setFilters((current) => ({ ...current, sort_by: 'created_at', sort_order: 'desc' })),
+        onRemove: () =>
+          setFilters((current) => ({
+            ...current,
+            sort_by: DEFAULT_SORT_BY,
+            sort_order: DEFAULT_SORT_ORDER,
+            page: 1,
+          })),
       });
     }
 
     return chips;
   }, [filters]);
 
-  const filterPanel = (
-    <FilterPanel
-      categories={CATEGORY_OPTIONS}
-      selectedCategories={filters.categories}
-      onToggleCategory={(value) =>
-        setFilters((current) => ({
-          ...current,
-          categories: toggleOne(current.categories, value),
-          page: 1,
-        }))
-      }
-      languages={LANGUAGE_OPTIONS}
-      selectedLanguages={filters.languages}
-      onToggleLanguage={(value) =>
-        setFilters((current) => ({
-          ...current,
-          languages: toggleOne(current.languages, value),
-          page: 1,
-        }))
-      }
-      networks={Array.from(ALL_NETWORK_FILTERS) as any}
-      selectedNetworks={filters.networks}
-      onToggleNetwork={(value) =>
-        setFilters((current) => ({
-          ...current,
-          networks: toggleOne(current.networks, value),
-          page: 1,
-        }))
-      }
-      author={filters.author}
-      onAuthorChange={(value) =>
-        setFilters((current) => ({ ...current, author: value, page: 1 }))
-      }
-      verifiedOnly={filters.verified_only}
-      onVerifiedChange={(value) =>
-        setFilters((current) => ({ ...current, verified_only: value, page: 1 }))
-      }
-    />
-  );
+  const filterPanelProps = {
+    categories: categoryOptions,
+    selectedCategories: filters.categories,
+    onToggleCategory: (value: string) =>
+      setFilters((current) => ({
+        ...current,
+        categories: toggleOne(current.categories, value),
+        page: 1,
+      })),
+    onClearCategories: () =>
+      setFilters((current) => ({
+        ...current,
+        categories: [],
+        page: 1,
+      })),
+    languages: LANGUAGE_OPTIONS,
+    selectedLanguages: filters.languages,
+    onToggleLanguage: (value: string) =>
+      setFilters((current) => ({
+        ...current,
+        languages: toggleOne(current.languages, value),
+        page: 1,
+      })),
+    networks: networkOptions,
+    selectedNetworks: filters.networks,
+    onToggleNetwork: (value: string) =>
+      setFilters((current) => ({
+        ...current,
+        networks: toggleOne(current.networks, value as ContractsUiFilters['networks'][number]),
+        page: 1,
+      })),
+    onClearNetworks: () =>
+      setFilters((current) => ({
+        ...current,
+        networks: [],
+        page: 1,
+      })),
+    author: filters.author,
+    onAuthorChange: (value: string) =>
+      setFilters((current) => ({ ...current, author: value, page: 1 })),
+    verifiedOnly: filters.verified_only,
+    onVerifiedChange: (value: boolean) =>
+      setFilters((current) => ({ ...current, verified_only: value, page: 1 })),
+    activeFilterCount: activeFilterChips.length,
+    onResetAll: clearAllFilters,
+  };
 
   return (
     <>
@@ -506,38 +557,31 @@ export function ContractsContent() {
 
             {/* Inline search */}
             <div className="max-w-2xl mx-auto mb-10">
-                {!isAdvancedSearch ? (
-                  <div className="relative">
-                    <SearchBar 
-                      value={filters.query}
-                      onChange={(val) => setFilters((prev) => ({ ...prev, query: val, page: 1 }))}
-                      onClear={() => setFilters((prev) => ({ ...prev, query: '', page: 1 }))}
-                      placeholder="Search contracts by name, category, or tag..."
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setMobileFiltersOpen(true)}
-                      className="md:hidden absolute right-2 top-1/2 -translate-y-1/2 px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90 transition-opacity font-medium text-sm"
-                    >
-                      Filters
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-6 text-left">
-                    <QueryBuilder 
-                      initialQuery={advancedQuery || undefined}
-                      onChange={(q) => setAdvancedQuery(q)}
-                      onSearch={() => {
-                        if (advancedQuery) syncToUrl(advancedQuery);
-                        refetch();
-                      }}
-                      onSave={() => {
-                        const name = prompt('Enter a name for this favorite search:');
-                        if (name) saveFavoriteMutation.mutate(name);
-                      }}
-                    />
-                  </div>
-                )}
+              <SearchBar
+                value={filters.query}
+                onChange={(next) =>
+                  setFilters((current) => ({ ...current, query: next, page: 1 }))
+                }
+                onClear={() => setFilters((current) => ({ ...current, query: '', page: 1 }))}
+                onCommit={(committed) => {
+                  const parsed = parseAdvancedContractQuery(committed);
+                  if (parsed.usesOr) {
+                    setFilters((current) => ({ ...current, query: committed, page: 1 }));
+                    return;
+                  }
+
+                  setFilters((current) => {
+                    const mergedTags = Array.from(new Set([...current.tags, ...parsed.tags]));
+                    return {
+                      ...current,
+                      query: parsed.cleanedSimpleQuery,
+                      tags: mergedTags,
+                      page: 1,
+                    };
+                  });
+                }}
+                placeholder="Search contracts by name, category, or tag..."
+              />
             </div>
 
             {/* Stats row */}
@@ -573,7 +617,10 @@ export function ContractsContent() {
         {/* Toolbar */}
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
           <div className="flex items-center gap-3">
-            <ResultsCount visibleCount={effectiveData?.items.length ?? 0} totalCount={effectiveData?.total ?? 0} />
+            <ResultsCount
+              visibleCount={effectiveData?.items.length ?? 0}
+              totalCount={effectiveData?.total ?? 0}
+            />
             {isFetching && !isLoading && (
               <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
                 <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -585,19 +632,15 @@ export function ContractsContent() {
           <div className="flex flex-wrap items-center gap-2">
             <SortDropdown
               value={filters.sort_by}
+              order={filters.sort_order}
               onChange={(value) =>
                 setFilters((current) => ({ ...current, sort_by: value, page: 1 }))
               }
+              onOrderChange={(value) =>
+                setFilters((current) => ({ ...current, sort_order: value, page: 1 }))
+              }
               showRelevance={!!filters.query}
             />
-            <select
-              value={filters.sort_order}
-              onChange={(e) => setFilters(prev => ({ ...prev, sort_order: e.target.value as 'asc' | 'desc', page: 1 }))}
-              className="px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20"
-            >
-              <option value="desc">Descending</option>
-              <option value="asc">Ascending</option>
-            </select>
             <button
               type="button"
               onClick={() => setMobileFiltersOpen(true)}
@@ -613,7 +656,7 @@ export function ContractsContent() {
 
         <div className="flex gap-8 mt-6">
           {/* Sidebar filters (desktop) */}
-          <aside className="hidden md:flex flex-col w-72 flex-shrink-0 gap-6">
+          <aside className="hidden md:flex flex-col w-72 shrink-0 gap-6">
             <div className="gradient-border-card p-5 sticky top-20">
               <div className="flex items-center gap-2 mb-5">
                 <Filter className="w-4 h-4 text-primary" />
@@ -621,7 +664,7 @@ export function ContractsContent() {
               </div>
               
               <>
-                {filterPanel}
+                <FilterPanel {...filterPanelProps} />
                 <div className="mt-5 pt-4 border-t border-border">
                   <div className="w-full">
                     <TagAutocomplete
@@ -646,22 +689,33 @@ export function ContractsContent() {
           {/* Results grid */}
           <div className="flex-1 min-w-0">
             {isLoading ? (
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8">
-                {Array.from({ length: 6 }).map((_, i) => (
+              <div
+                role="status"
+                aria-label="Loading contracts"
+                aria-live="polite"
+                className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8"
+              >
+                {Array.from({ length: DEFAULT_PAGE_SIZE }).map((_, i) => (
                   <ContractCardSkeleton key={i} />
                 ))}
+                <span className="sr-only">Loading contracts, please wait…</span>
               </div>
             ) : effectiveData && effectiveData.items.length > 0 ? (
               <>
-                <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8">
+                <div
+                  aria-live="polite"
+                  aria-atomic="true"
+                  className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8 animate-in fade-in duration-300"
+                >
                   {effectiveData.items.map((contract: Contract) => (
-                    <ContractCard key={contract.id} contract={contract} />
+                    <ContractCard key={contract.id} contract={contract} sortBy={filters.sort_by} />
                   ))}
                 </div>
 
                 {effectiveData.total_pages > 1 && (
                   <div className="flex flex-wrap items-center justify-center gap-2 py-4">
                     <button
+                      type="button"
                       onClick={() =>
                         setFilters((current) => ({ ...current, page: Math.max(1, current.page - 1) }))
                       }
@@ -709,8 +763,12 @@ export function ContractsContent() {
                     })}
 
                     <button
+                      type="button"
                       onClick={() =>
-                        setFilters((current) => ({ ...current, page: current.page + 1 }))
+                        setFilters((current) => ({
+                          ...current,
+                          page: Math.min(effectiveData.total_pages, current.page + 1),
+                        }))
                       }
                       disabled={filters.page >= effectiveData.total_pages}
                       className="px-4 py-2 rounded-lg border border-border text-foreground disabled:opacity-50 disabled:cursor-not-allowed hover:bg-accent transition-colors text-sm font-medium"
@@ -721,24 +779,17 @@ export function ContractsContent() {
                 )}
               </>
             ) : (
-              <div className="text-center py-20 gradient-border-card">
-                <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 mb-6">
-                  <Package className="w-8 h-8 text-primary" />
-                </div>
-                <h3 className="text-xl font-semibold mb-2">No contracts found</h3>
-                <p className="text-muted-foreground mb-6 max-w-md mx-auto">
-                  No contracts match the current filters. Try adjusting your search or clearing filters.
+              <div className="text-center py-16 bg-card/50 border border-border rounded-xl">
+                <Search className="w-12 h-12 text-muted-foreground mx-auto mb-4 opacity-50" />
+                <h3 className="text-lg font-semibold mb-2">No contracts found</h3>
+                <p className="text-muted-foreground max-w-md mx-auto mb-6 text-sm">
+                  We couldn't find any contracts matching your current filters. Try adjusting your
+                  search or clearing some filters.
                 </p>
                 <button
                   type="button"
-                  onClick={() => {
-                    logEvent('search_performed', {
-                      keyword: '',
-                      action: 'clear_all_filters',
-                    });
-                    clearAllFilters();
-                  }}
-                  className="btn-glow px-6 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium"
+                  onClick={clearAllFilters}
+                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90 transition-opacity text-sm font-medium"
                 >
                   Clear all filters
                 </button>
@@ -748,49 +799,58 @@ export function ContractsContent() {
         </div>
       </div>
 
-      {/* Mobile Filters Drawer */}
       {mobileFiltersOpen && (
-        <div className="md:hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm">
-          <div className="absolute right-0 top-0 h-full w-[88%] max-w-sm bg-background border-l border-border p-5 shadow-2xl animate-in slide-in-from-right duration-300 overflow-y-auto">
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2">
-                <Filter className="w-4 h-4 text-primary" />
-                <h2 className="text-lg font-semibold">Filters</h2>
+        <div className="fixed inset-0 z-50 md:hidden">
+          <button
+            type="button"
+            aria-label="Close filters"
+            onClick={() => setMobileFiltersOpen(false)}
+            className="absolute inset-0 bg-black/50"
+          />
+          <div className="absolute inset-y-0 right-0 flex w-full max-w-sm flex-col bg-background shadow-2xl">
+            <div className="flex items-center justify-between border-b border-border px-4 py-4">
+              <div>
+                <h2 className="text-base font-semibold text-foreground">Filters</h2>
+                <p className="text-xs text-muted-foreground">Narrow down contract discovery</p>
               </div>
               <button
                 type="button"
                 onClick={() => setMobileFiltersOpen(false)}
-                className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                aria-label="Close filters"
+                className="rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
               >
-                <X className="w-5 h-5" />
+                <X className="h-4 w-4" />
               </button>
             </div>
-            {filterPanel}
 
-            <div className="mt-5 pt-4 border-t border-border">
-              <TagAutocomplete
-                onSelect={(tag) =>
-                  setFilters((current) => {
-                    if (current.tags.includes(tag.name)) return current;
-                    return {
-                      ...current,
-                      tags: [...current.tags, tag.name],
-                      page: 1,
-                    };
-                  })
-                }
-                placeholder="Filter by tag..."
-              />
+            <div className="flex-1 overflow-y-auto px-4 py-4">
+              <FilterPanel {...filterPanelProps} />
+
+              <div className="mt-5 border-t border-border pt-4">
+                <TagAutocomplete
+                  onSelect={(tag) =>
+                    setFilters((current) => {
+                      if (current.tags.includes(tag.name)) return current;
+                      return {
+                        ...current,
+                        tags: [...current.tags, tag.name],
+                        page: 1,
+                      };
+                    })
+                  }
+                  placeholder="Filter by tag..."
+                />
+              </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setMobileFiltersOpen(false)}
-              className="mt-8 w-full px-4 py-3 rounded-xl bg-primary text-primary-foreground hover:opacity-90 transition-opacity font-medium btn-glow"
-            >
-              Show results
-            </button>
+            <div className="border-t border-border px-4 py-4">
+              <button
+                type="button"
+                onClick={() => setMobileFiltersOpen(false)}
+                className="w-full rounded-xl bg-primary px-4 py-3 text-sm font-medium text-primary-foreground"
+              >
+                Apply filters
+              </button>
+            </div>
           </div>
         </div>
       )}

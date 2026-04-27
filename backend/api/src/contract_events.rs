@@ -19,7 +19,55 @@ use crate::auth::AuthClaims;
 use crate::state::{AppState, ContractEventVisibility, RealtimeEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContractEventEnvelope;
+pub struct ContractEventContract {
+    pub id: Uuid,
+    pub contract_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub publisher_id: Uuid,
+    pub network: String,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub wasm_hash: String,
+    pub is_verified: bool,
+}
+
+impl From<&Contract> for ContractEventContract {
+    fn from(contract: &Contract) -> Self {
+        Self {
+            id: contract.id,
+            contract_id: contract.contract_id.clone(),
+            name: contract.name.clone(),
+            description: contract.description.clone(),
+            publisher_id: contract.publisher_id,
+            network: contract.network.to_string(),
+            category: contract.category.clone(),
+            tags: contract.tags.iter().map(|t| t.name.clone()).collect(),
+            wasm_hash: contract.wasm_hash.clone(),
+            is_verified: contract.is_verified,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractEventEnvelope {
+    pub event_type: String,
+    pub visibility: ContractEventVisibility,
+    pub contract: ContractEventContract,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
 
 impl ContractEventEnvelope {
     pub fn version_created(contract: &Contract, version: &ContractVersion) -> RealtimeEvent {
@@ -186,21 +234,29 @@ impl SubscriptionFilter {
         None
     }
 
-    fn matches(&self, event: &RealtimeEvent) -> bool {
-        let (event_contract_id, is_private) = match event {
-            RealtimeEvent::ContractDeployed { contract_id, .. } => (contract_id, false),
-            RealtimeEvent::ContractUpdated { contract_id, .. } => (contract_id, false),
-            RealtimeEvent::CicdPipeline { contract_id, .. } => (contract_id, false),
-            RealtimeEvent::VersionCreated { contract_id, .. } => (contract_id, false),
-            RealtimeEvent::MetadataUpdated { contract_id, visibility, .. } => (
-                contract_id,
-                matches!(visibility, ContractEventVisibility::Private),
-            ),
-            RealtimeEvent::StatusUpdated { contract_id, visibility, .. } => (
-                contract_id,
-                matches!(visibility, ContractEventVisibility::Private),
-            ),
-        };
+    #[allow(dead_code)]
+    fn matches(&self, event: &ContractEventEnvelope) -> bool {
+        if !self.contract_ids.is_empty() {
+            let contract_uuid = event.contract.id.to_string().to_ascii_lowercase();
+            let contract_id = event.contract.contract_id.to_ascii_lowercase();
+            if !self.contract_ids.contains(&contract_uuid)
+                && !self.contract_ids.contains(&contract_id)
+            {
+                return false;
+            }
+        }
+
+        if !self.categories.is_empty() {
+            let category = event
+                .contract
+                .category
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !self.categories.contains(&category) {
+                return false;
+            }
+        }
 
         if !self.contract_ids.is_empty() && !self.contract_ids.contains(&event_contract_id.to_ascii_lowercase()) {
             return false;
@@ -254,9 +310,8 @@ enum ServerMessage {
         subscriptions: SubscriptionSnapshot,
         warning: Option<String>,
     },
-    Event {
-        event: RealtimeEvent,
-    },
+    #[allow(dead_code)]
+    Event { event: Arc<ContractEventEnvelope> },
     Heartbeat {
         timestamp: chrono::DateTime<chrono::Utc>,
         reconnect_after_ms: u64,
@@ -265,6 +320,7 @@ enum ServerMessage {
         message: String,
         reconnect_after_ms: u64,
     },
+    #[allow(dead_code)]
     ResyncRequired {
         dropped_events: u64,
         reconnect_after_ms: u64,
@@ -346,11 +402,11 @@ async fn handle_socket(
     static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
     let connection_id = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let (mut sender, mut receiver) = socket.split();
-    let mut events = state.event_broadcaster.subscribe();
-    
+    let mut events = state.contract_events.subscribe();
+
     // Fixed intervals for heartbeat and reconnect
     let heartbeat_ms: u64 = 30_000; // 30 seconds
-    let reconnect_ms: u64 = 5_000;  // 5 seconds
+    let reconnect_ms: u64 = 5_000; // 5 seconds
 
     let connected = ServerMessage::Connected {
         connection_id,
@@ -391,13 +447,9 @@ async fn handle_socket(
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        // Convert RealtimeEvent to a simple JSON representation
-                        let json_msg = serde_json::json!({
-                            "type": "event",
-                            "data": event,
-                        });
-                        if let Ok(json_str) = serde_json::to_string(&json_msg) {
-                            if sender.send(Message::Text(json_str)).await.is_err() {
+                        if filter.matches(&event) {
+                            let msg = ServerMessage::Event { event: event.clone() };
+                            if send_json(&mut sender, &msg).await.is_err() {
                                 break;
                             }
                         }
@@ -425,7 +477,7 @@ async fn handle_socket(
                 if send_json(&mut sender, &msg).await.is_err() {
                     break;
                 }
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if sender.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
                 }
             }
@@ -485,7 +537,7 @@ async fn send_json(
 ) -> Result<(), axum::Error> {
     let payload =
         serde_json::to_string(message).expect("server websocket messages should always serialize");
-    sender.send(Message::Text(payload.into())).await
+    sender.send(Message::Text(payload)).await
 }
 
 #[cfg(test)]
@@ -504,13 +556,19 @@ mod tests {
             network: Network::Testnet,
             is_verified: false,
             category: Some("DeFi".to_string()),
-            tags: vec!["amm".to_string()],
+            tags: vec![shared::Tag { id: Uuid::nil(), name: "amm".to_string(), color: "#888888".to_string() }],
             created_at: Utc::now(),
             updated_at: Utc::now(),
             health_score: 0,
             is_maintenance: false,
             logical_id: None,
             network_configs: None,
+            verified_at: None,
+            last_accessed_at: None,
+            relevance_score: None,
+            organization_id: None,
+            visibility: shared::VisibilityType::Public,
+            current_version: None,
         }
     }
 

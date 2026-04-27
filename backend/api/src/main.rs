@@ -1,18 +1,3 @@
-mod aggregation;
-mod analytics;
-mod audit_handlers;
-mod audit_routes;
-mod benchmark_engine;
-mod benchmark_handlers;
-mod benchmark_routes;
-mod checklist;
-mod detector;
-mod error;
-mod handlers;
-mod incident_handlers;
-mod incident_routes;
-mod models;
-mod rate_limit;
 #![warn(unused_imports)]
 
 mod ab_test_handlers;
@@ -29,6 +14,10 @@ mod compatibility_testing_handlers;
 mod contract_events;
 mod contributor_handlers;
 mod db_monitoring;
+mod governance_handlers;
+mod graphql;
+mod interoperability;
+mod interoperability_handlers;
 
 mod activity_feed_handlers;
 mod activity_feed_routes;
@@ -40,32 +29,35 @@ mod dependency_handlers;
 mod deprecation_handlers;
 mod error;
 mod events;
+mod favorites_handlers;
 mod handlers;
 mod health;
 pub mod health_monitor;
 #[cfg(test)]
 mod health_tests;
+mod incident_handlers;
+mod incident_routes;
 mod metrics;
 mod metrics_handler;
 mod migration_handlers;
 mod models;
 mod multisig_handlers;
 mod multisig_routes;
-mod notification_handlers;
-mod notification_routes;
+mod mutation_testing_handlers; // Issue #619
 mod onchain_verification;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod org_handlers;
 mod patch_handlers;
+mod plugin_marketplace_handlers;
 mod performance_handlers;
 mod rate_limit;
+mod recommendation_handlers;
 mod release_notes_handlers;
 mod release_notes_routes;
 pub mod request_tracing;
 mod resource_handlers;
 mod resource_tracking;
-mod recommendation_handlers;
 mod routes;
 pub mod security_log;
 pub mod signing_handlers;
@@ -74,9 +66,22 @@ mod simulation;
 mod simulation_handlers;
 mod state;
 
+mod clone_federation_handlers;
+mod formal_verification;
+mod formal_verification_handlers;
+mod graph_analysis;
+mod graph_analysis_handlers;
+mod pagination;
+mod gas_estimation_handlers;
+mod security_scan_handlers;
+mod subscription_handlers;
 mod type_safety;
 mod validation;
-
+mod webhook_delivery;
+mod websocket;
+mod quota_handlers;
+mod verification_handlers;
+mod zk_proof_handlers;
 
 use anyhow::Result;
 use axum::extract::{Request, State};
@@ -112,37 +117,20 @@ async fn track_in_flight_middleware(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables
-    dotenv().ok();
+    // Load and validate configuration (#768)
+    let config = config::load_config()?;
 
     // Initialize structured JSON tracing (ELK/Splunk compatible)
     request_tracing::init_json_tracing();
-
-    // Fail fast on startup when JWT configuration is invalid.
-    if let Err(err) = auth::AuthManager::from_env() {
-        tracing::error!(
-            error = %err,
-            "JWT authentication configuration is invalid. Set JWT_SECRET to a strong value with at least {} characters.",
-            auth::MIN_JWT_SECRET_LEN
-        );
-        return Err(anyhow::anyhow!(
-            "Invalid JWT authentication configuration: {}",
-            err
-        ));
-    }
-
-    // Database connection with dynamic pool size
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let logical_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let default_max_pool = (logical_cores * 2).max(10);
     let max_pool_size = std::env::var("DB_MAX_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default_max_pool as u32);
+        .unwrap_or((logical_cores * 2).max(10) as u32);
 
     tracing::info!(
         max_pool_size = max_pool_size,
@@ -153,7 +141,9 @@ async fn main() -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(max_pool_size)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&database_url)
+        .connect_with(
+            config.database_url.parse::<sqlx::postgres::PgConnectOptions>()?
+        )
         .await?;
 
     // Run migrations (skip if SKIP_MIGRATIONS=true, useful when migrations were applied manually)
@@ -196,7 +186,17 @@ async fn main() -> Result<()> {
     let je = job_engine.clone();
     tokio::spawn(async move { je.run_worker(job_rx).await });
 
-    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await?;
+    // Issue #727: create rate limiter before AppState so it can be shared
+    let rate_limit_state = std::sync::Arc::new(RateLimitState::from_env());
+    rate_limit_state.spawn_eviction_task();
+
+    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone(), rate_limit_state.clone()).await?;
+
+    // Initialize GraphQL schema
+    let schema = graphql::schema::build_schema(state.clone());
+
+    // Spawn webhook delivery background task
+    webhook_delivery::spawn_webhook_delivery_task(pool.clone());
 
     // Spawn the background DB and cache monitoring task
     db_monitoring::spawn_db_monitoring_task(pool.clone(), state.cache.clone());
@@ -215,9 +215,6 @@ async fn main() -> Result<()> {
 
     // Warm up the cache
     state.cache.clone().warm_up(pool.clone());
-
-    let rate_limit_state = RateLimitState::from_env();
-    rate_limit_state.spawn_eviction_task();
 
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| {
         "http://localhost:3000,https://soroban-registry.vercel.app".to_string()
@@ -258,6 +255,7 @@ async fn main() -> Result<()> {
     // Build router
     let app = Router::new()
         .merge(routes::auth_routes())
+        .merge(routes::plugin_routes())
         .merge(routes::organization_routes())
         .merge(routes::contract_routes())
         .merge(routes::publisher_routes())
@@ -271,14 +269,31 @@ async fn main() -> Result<()> {
         .merge(routes::admin_routes())
         .merge(routes::category_routes())
         .merge(routes::compatibility_dashboard_routes())
+        .merge(routes::governance_routes())
         .merge(routes::canary_routes())
         .merge(routes::ab_test_routes())
         .merge(routes::performance_routes())
+        .merge(routes::federation_routes())
+        .merge(routes::mutation_testing_routes()) // Issue #619
         .merge(multisig_routes::routes())
         .merge(routes::collaborative_review_routes())
         .merge(routes::observability_routes())
         .merge(routes::websocket_routes())
+        .merge(routes::subscription_routes())
+        .merge(routes::graph_analysis_routes())
+        .merge(routes::formal_verification_routes())
+        .merge(routes::verification_status_routes())
+        .merge(routes::quota_routes())
+        .merge(routes::validator_routes())
         .merge(release_notes_routes::release_notes_routes())
+        .route(
+            "/api/graphql",
+            axum::routing::post(graphql::graphql_handler).with_state(schema),
+        )
+        .route(
+            "/api/graphql/playground",
+            axum::routing::get(graphql::graphql_playground),
+        )
         .nest("/api", activity_feed_routes::routes())
         .fallback(handlers::route_not_found)
         .layer(middleware::from_fn(
@@ -292,7 +307,7 @@ async fn main() -> Result<()> {
             track_in_flight_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            rate_limit_state,
+            (*rate_limit_state).clone(),
             rate_limit::rate_limit_middleware,
         ))
         .layer(cors)

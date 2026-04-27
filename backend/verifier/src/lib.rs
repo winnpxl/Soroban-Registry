@@ -12,6 +12,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::Value;
 use std::process::Stdio;
 use tempfile::TempDir;
+use tokio::{process::Command, time::timeout};
+use tracing::instrument;
 
 const DEFAULT_SOROBAN_SDK_VERSION: &str = "21.7.7";
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -24,14 +26,7 @@ pub struct VerificationResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct VerificationOutput {
-    pub is_verified: bool,
-    pub compiler_output: String,
-    pub built_wasm_hash: Option<String>,
-}
-
-/// Verify that source code matches deployed contract bytecode.
+#[instrument(skip(source_code, build_params), fields(component = "verifier", deployed_wasm_hash = %deployed_wasm_hash))]
 pub async fn verify_contract(
     source_code: &str,
     deployed_wasm_hash: &str,
@@ -80,6 +75,7 @@ pub async fn verify_contract(
 /// Supports two source modes:
 /// - raw Rust contract source (compiled with cargo)
 /// - `wasm_base64:<...>` for precompiled test payloads
+#[instrument(skip(source_code, build_params), fields(component = "verifier"))]
 pub async fn compile_contract(
     source_code: &str,
     compiler_version: Option<&str>,

@@ -1,12 +1,25 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::fmt;
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EXISTING REGISTRY TYPES
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Represents a tag that can be attached to a contract
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema, PartialEq)]
+#[derive(sqlx::Type)]
+#[sqlx(type_name = "tag")]
+pub struct Tag {
+    pub id: Uuid,
+    pub name: String,
+    pub color: String,
+}
+
 
 /// Represents a smart contract in the registry
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
@@ -20,7 +33,10 @@ use uuid::Uuid;
     "network": "mainnet",
     "is_verified": true,
     "category": "DeFi",
-    "tags": ["yield", "optimization"],
+    "tags": [
+        {"id": "550e8400-e29b-41d4-a716-446655440005", "name": "yield", "color": "#888888"},
+        {"id": "550e8400-e29b-41d4-a716-446655440006", "name": "optimization", "color": "#888888"}
+    ],
     "created_at": "2023-10-27T10:00:00Z",
     "updated_at": "2023-10-27T10:00:00Z"
 }))]
@@ -29,15 +45,25 @@ pub struct Contract {
     pub contract_id: String,
     pub wasm_hash: String,
     pub name: String,
+    pub slug: String,
     pub description: Option<String>,
     pub publisher_id: Uuid,
     pub network: Network,
     pub is_verified: bool,
+    /// Overall verification status for the contract (unverified, pending, verified, failed)
+    pub verification_status: VerificationStatus,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
+    pub deployed_at: Option<DateTime<Utc>>,
+    /// Who verified the contract (publisher/user id)
+    pub verified_by: Option<Uuid>,
+    /// Optional notes attached to the verification
+    pub verification_notes: Option<String>,
     pub last_accessed_at: Option<DateTime<Utc>>,
     #[sqlx(default)]
     pub health_score: i32,
@@ -131,14 +157,33 @@ pub struct NetworkInfo {
     pub status_message: Option<String>,
 }
 
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NetworkListResponse {
     pub networks: Vec<NetworkInfo>,
     pub cached_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NetworkHealth {
+    pub network_id: String,
+    pub name: String,
+    pub status: NetworkStatus,
+    pub rpc_available: bool,
+    pub last_indexed_ledger: Option<i64>,
+    pub current_ledger: Option<u32>,
+    pub indexer_lag: Option<i64>,
+    pub last_checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NetworkHealthResponse {
+    pub health: Vec<NetworkHealth>,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Network where the contract is deployed
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq, Eq)]
 #[sqlx(type_name = "network_type", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
@@ -155,6 +200,97 @@ impl std::fmt::Display for Network {
             Network::Futurenet => write!(f, "futurenet"),
         }
     }
+}
+
+fn parse_network_value<E: de::Error>(value: &str) -> Result<Network, E> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => Ok(Network::Mainnet),
+        "testnet" => Ok(Network::Testnet),
+        "futurenet" => Ok(Network::Futurenet),
+        _ => Err(E::custom(format!(
+            "invalid network `{value}`; expected mainnet, testnet, or futurenet"
+        ))),
+    }
+}
+
+fn deserialize_optional_networks<'de, D>(deserializer: D) -> Result<Option<Vec<Network>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NetworksVisitor;
+
+    impl<'de> Visitor<'de> for NetworksVisitor {
+        type Value = Option<Vec<Network>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a comma-separated string or sequence of network names")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut networks = Vec::new();
+            while let Some(network) = seq.next_element::<Network>()? {
+                networks.push(network);
+            }
+
+            if networks.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(networks))
+            }
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let networks: Result<Vec<_>, _> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|network| !network.is_empty())
+                .map(parse_network_value)
+                .collect();
+
+            let networks = networks?;
+            if networks.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(networks))
+            }
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(value)
+        }
+    }
+
+    deserializer.deserialize_any(NetworksVisitor)
 }
 
 /// Upgrade strategy for contract upgrades
@@ -243,6 +379,35 @@ pub struct ContractVersion {
     pub reverted_from: Option<String>,
 }
 
+/// Represents a historical version of contract metadata (#729)
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ContractMetadataVersion {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub change_summary: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Represents a difference in a single field of metadata (#729)
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MetadataDiff {
+    pub field: String,
+    pub old_value: Option<serde_json::Value>,
+    pub new_value: Option<serde_json::Value>,
+}
+
+/// Response containing the metadata history for a contract (#729)
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MetadataHistoryResponse {
+    pub contract_id: Uuid,
+    pub versions: Vec<ContractMetadataVersion>,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MULTI-TENANCY TYPES (Issue #420)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -329,6 +494,8 @@ pub struct Verification {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "verification_status", rename_all = "lowercase")]
 pub enum VerificationStatus {
+    #[serde(rename = "unverified")]
+    Unverified,
     Pending,
     Verified,
     Failed,
@@ -421,7 +588,8 @@ pub struct GraphNode {
     pub network: Network,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[sqlx(skip)]
+    pub tags: Vec<Tag>,
 }
 
 /// Graph edge (dependency relationship)
@@ -443,12 +611,167 @@ pub struct GraphResponse {
     pub edges: Vec<GraphEdge>,
 }
 
+// ── Graph analysis types ──────────────────────────────────────────────────────
+
+/// A detected sub-network (community) within the contract interaction graph.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GraphCluster {
+    /// Stable cluster identifier (integer label from community detection).
+    pub cluster_id: usize,
+    /// Contract UUIDs that belong to this cluster.
+    pub members: Vec<Uuid>,
+    /// The highest-degree node in the cluster — acts as the cluster hub.
+    pub hub_contract_id: Option<Uuid>,
+    /// Average internal edge weight (call frequency) within the cluster.
+    pub cohesion: f64,
+    /// Number of edges crossing into other clusters.
+    pub external_edges: usize,
+}
+
+/// Per-contract criticality ranking combining multiple centrality measures.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CriticalContractScore {
+    pub contract_id: Uuid,
+    pub contract_name: String,
+    /// Combined criticality score in [0, 1]; higher = more critical.
+    pub criticality_score: f64,
+    /// PageRank score — measures influence propagated through in-edges.
+    pub pagerank: f64,
+    /// Betweenness centrality — fraction of shortest paths passing through.
+    pub betweenness: f64,
+    /// In-degree: number of contracts that directly depend on this one.
+    pub in_degree: usize,
+    /// Out-degree: number of contracts this one directly depends on.
+    pub out_degree: usize,
+    /// Cluster this contract belongs to.
+    pub cluster_id: Option<usize>,
+}
+
+/// One hop in a vulnerability propagation path.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PropagationHop {
+    pub contract_id: Uuid,
+    pub contract_name: String,
+    /// Hops from the vulnerable source contract.
+    pub depth: usize,
+    /// Accumulated risk score at this node (decays with distance).
+    pub risk_score: f64,
+    /// Direct dependents that are also at risk.
+    pub propagates_to: Vec<Uuid>,
+}
+
+/// Result of a vulnerability propagation analysis from one or more source contracts.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct VulnerabilityPropagationResult {
+    /// The contract(s) where the vulnerability originates.
+    pub source_contracts: Vec<Uuid>,
+    /// All contracts reachable from sources, ordered by risk score.
+    pub affected_contracts: Vec<PropagationHop>,
+    /// Total number of contracts at risk (any depth).
+    pub total_affected: usize,
+    /// Maximum propagation depth reached.
+    pub max_depth: usize,
+    /// True if the propagation path contains a cycle.
+    pub has_cycles: bool,
+}
+
+/// Complete graph analysis report.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GraphAnalysisReport {
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub clusters: Vec<GraphCluster>,
+    pub critical_contracts: Vec<CriticalContractScore>,
+    /// IDs of contracts that belong to strongly-connected components (cycles).
+    pub cyclic_contracts: Vec<Uuid>,
+    pub analysis_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolComplianceStatus {
+    Compliant,
+    Partial,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InteroperabilityCapabilityKind {
+    Bridge,
+    Adapter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InteroperabilityProtocolMatch {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub status: ProtocolComplianceStatus,
+    pub matched_functions: Vec<String>,
+    pub missing_functions: Vec<String>,
+    pub optional_matches: Vec<String>,
+    pub compliance_score: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InteroperabilityCapability {
+    pub kind: InteroperabilityCapabilityKind,
+    pub label: String,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InteroperabilitySuggestion {
+    pub contract_id: Uuid,
+    pub contract_address: String,
+    pub contract_name: String,
+    pub network: Network,
+    pub category: Option<String>,
+    pub is_verified: bool,
+    pub score: f64,
+    pub reason: String,
+    pub shared_protocols: Vec<String>,
+    pub shared_functions: Vec<String>,
+    pub relation_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InteroperabilitySummary {
+    pub protocol_matches: usize,
+    pub compatible_contracts: usize,
+    pub suggested_contracts: usize,
+    pub graph_nodes: usize,
+    pub graph_edges: usize,
+    pub bridge_signals: usize,
+    pub adapter_signals: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractInteroperabilityResponse {
+    pub contract_id: Uuid,
+    pub contract_address: String,
+    pub contract_name: String,
+    pub network: Network,
+    pub analyzed_at: DateTime<Utc>,
+    pub has_abi: bool,
+    pub analyzed_functions: Vec<String>,
+    pub warnings: Vec<String>,
+    pub protocols: Vec<InteroperabilityProtocolMatch>,
+    pub capabilities: Vec<InteroperabilityCapability>,
+    pub suggestions: Vec<InteroperabilitySuggestion>,
+    pub graph: GraphResponse,
+    pub summary: InteroperabilitySummary,
+}
+
 /// Request to publish a new contract
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PublishRequest {
     pub contract_id: String,
     pub wasm_hash: String,
     pub name: String,
+    pub slug: Option<String>,
     pub description: Option<String>,
     pub network: Network,
     pub category: Option<String>,
@@ -483,6 +806,21 @@ pub struct UpdateContractStatusRequest {
     pub status: String,
     pub error_message: Option<String>,
     pub user_id: Option<Uuid>,
+}
+
+/// Item for bulk contract status updates
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BulkStatusUpdateItem {
+    pub id: Uuid,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub user_id: Option<Uuid>,
+}
+
+/// Bulk status update request body
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BulkStatusUpdateRequest {
+    pub items: Vec<BulkStatusUpdateItem>,
 }
 
 /// Request to create a new contract version with ABI
@@ -692,8 +1030,11 @@ pub struct ContractSearchParams {
     pub query: Option<String>,
     pub network: Option<Network>,
     /// Multiple networks filter (e.g. ?networks=mainnet&networks=testnet)
+    #[serde(default, deserialize_with = "deserialize_optional_networks")]
     pub networks: Option<Vec<Network>>,
     pub verified_only: Option<bool>,
+    /// Filter by verification_status (unverified, pending, verified, failed)
+    pub verification_status: Option<VerificationStatus>,
     pub category: Option<String>,
     /// Multiple categories filter (e.g. ?categories=DeFi&categories=NFT)
     pub categories: Option<Vec<String>>,
@@ -763,7 +1104,8 @@ pub struct ContractMetadataExportRecord {
     pub network: String,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[sqlx(skip)]
+    pub tags: Vec<Tag>,
     pub maturity: Option<String>,
     pub health_score: i32,
     pub is_maintenance: bool,
@@ -871,6 +1213,37 @@ pub struct AdvancedSearchRequest {
     pub sort_order: Option<SortOrder>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ContractSearchParams, Network};
+
+    #[test]
+    fn parses_comma_separated_networks() {
+        let params: ContractSearchParams = serde_json::from_str(
+            r#"{"networks":"mainnet,testnet"}"#,
+        )
+        .expect("query params should deserialize");
+
+        assert_eq!(
+            params.networks,
+            Some(vec![Network::Mainnet, Network::Testnet])
+        );
+    }
+
+    #[test]
+    fn parses_sequence_networks() {
+        let params: ContractSearchParams = serde_json::from_str(
+            r#"{"networks":["mainnet","futurenet"]}"#,
+        )
+        .expect("query params should deserialize");
+
+        assert_eq!(
+            params.networks,
+            Some(vec![Network::Mainnet, Network::Futurenet])
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 pub struct FavoriteSearch {
     pub id: Uuid,
@@ -931,9 +1304,15 @@ pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
     pub total: i64,
     pub page: i64,
+    /// Number of items per page (serialised as `per_page`).
+    #[serde(rename = "per_page")]
     pub page_size: i64,
+    /// Total number of pages (serialised as `pages`).
+    #[serde(rename = "pages")]
     pub total_pages: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_cursor: Option<String>,
 }
 
@@ -1546,7 +1925,17 @@ pub struct RecordPerformanceMetricRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
-
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RecordPerformanceBenchmarkRequest {
+    pub contract_id: Option<String>,
+    pub contract_version_id: Option<String>,
+    pub benchmark_name: String,
+    pub execution_time_ms: f64,
+    pub gas_used: i64,
+    pub sample_size: Option<i32>,
+    pub source: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PerformanceBenchmark {
@@ -1610,11 +1999,10 @@ pub struct ContractPerformanceSummaryResponse {
     pub contract_id: Uuid,
     pub latest_benchmarks: Vec<PerformanceBenchmark>,
     pub metric_snapshots: Vec<PerformanceMetricSnapshot>,
-    pub trend_points: Vec<PerformanceTrendPoint>,
+    pub trends: Vec<PerformanceTrendPoint>,
     pub regressions: Vec<PerformanceRegression>,
-    pub recent_anomalies: Vec<PerformanceAnomaly>,
-    pub recent_alerts: Vec<PerformanceAlert>,
     pub comparisons: Vec<PerformanceComparisonEntry>,
+    pub unresolved_alerts: Vec<PerformanceAlert>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1625,6 +2013,7 @@ pub struct CreateAlertConfigRequest {
     pub threshold_value: f64,
     pub severity: Option<AlertSeverity>,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "similarity_match_type", rename_all = "snake_case")]
@@ -1846,6 +2235,7 @@ pub struct DailyAggregate {
     pub verification_count: i32,
     pub publish_count: i32,
     pub version_count: i32,
+    pub update_count: i32,
     pub total_events: i32,
     pub unique_users: i32,
     pub network_breakdown: serde_json::Value,
@@ -1939,7 +2329,9 @@ pub struct TrendingContract {
     pub network: Network,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     pub created_at: DateTime<Utc>,
     // Popularity metrics
     pub popularity_score: f64,
@@ -2104,6 +2496,9 @@ pub struct ActivityFeedParams {
 
     /// Optionally filter by event type.
     pub event_type: Option<AnalyticsEventType>,
+
+    /// Optionally filter by contract ID.
+    pub contract_id: Option<Uuid>,
 }
 
 fn default_activity_limit() -> i64 {
@@ -2858,6 +3253,88 @@ pub struct ContractFunctionInfo {
     pub is_view: bool,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GAS USAGE ESTIMATION TYPES (Issue #496)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Confidence level of a gas estimate based on available historical data.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GasEstimateConfidence {
+    /// Derived from ≥10 real invocations.
+    High,
+    /// Derived from 1–9 real invocations.
+    Medium,
+    /// No historical data; purely heuristic.
+    Low,
+}
+
+/// Gas estimate for a single contract method.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MethodGasEstimate {
+    /// Name of the contract method.
+    pub method_name: String,
+    /// Lower bound of expected gas cost in stroops.
+    pub min_gas_stroops: i64,
+    /// Upper bound of expected gas cost in stroops.
+    pub max_gas_stroops: i64,
+    /// Average (or heuristic mid-point) gas cost in stroops.
+    pub avg_gas_stroops: i64,
+    /// Convenience field: average cost converted to XLM.
+    pub avg_gas_xlm: f64,
+    /// How confident the estimate is based on available samples.
+    pub confidence: GasEstimateConfidence,
+    /// Number of real invocations the estimate is based on (0 = heuristic only).
+    pub sample_count: i64,
+    /// Whether historical data was used for this estimate.
+    pub from_history: bool,
+    /// Unix timestamp (seconds) when the underlying data was last refreshed.
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Optional method-level parameters that make estimates more accurate.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MethodParamHint {
+    /// Parameter name (as declared in the ABI).
+    pub name: String,
+    /// JSON-serialisable value used only for heuristic sizing.
+    pub value: serde_json::Value,
+}
+
+/// Query parameters for `GET /api/contracts/:id/methods/:method/gas-estimate`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::IntoParams)]
+pub struct GasEstimateQuery {
+    /// Optional JSON-encoded array of `MethodParamHint` for a more realistic estimate.
+    #[serde(default)]
+    pub params: Option<String>,
+}
+
+/// Request body for batch gas estimation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchGasEstimateRequest {
+    /// List of method names to estimate.  Must be non-empty (max 50).
+    pub methods: Vec<BatchMethodEntry>,
+}
+
+/// One entry in a batch gas-estimate request.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchMethodEntry {
+    /// Name of the method to estimate.
+    pub method_name: String,
+    /// Optional parameter hints for this method.
+    #[serde(default)]
+    pub params: Vec<MethodParamHint>,
+}
+
+/// Response for batch gas estimation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchGasEstimateResponse {
+    /// Estimates in the same order as the request.
+    pub estimates: Vec<MethodGasEstimate>,
+    /// Methods that were requested but could not be estimated (e.g., not in ABI).
+    pub not_found: Vec<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3060,13 +3537,891 @@ pub struct ReviewVoteResponse {
     pub vote_recorded: bool,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #487: Contract Clone/Mirror Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Request to clone an existing contract
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct RecordPerformanceBenchmarkRequest {
-    pub benchmark_name: String,
-    pub contract_version_id: Option<String>,
-    pub execution_time_ms: f64,
-    pub gas_used: i64,
-    pub sample_size: Option<i32>,
-    pub source: Option<String>,
+pub struct CloneContractRequest {
+    /// New name for the cloned contract (optional, defaults to original name + " Clone")
+    #[schema(example = "MyYieldOptimizer V2")]
+    pub name: Option<String>,
+    /// New description for the cloned contract (optional)
+    #[schema(example = "A modified version of the original yield optimizer")]
+    pub description: Option<String>,
+    /// Target network for the clone (optional, defaults to original network)
+    pub network: Option<Network>,
+    /// New contract ID/address for the clone (required)
+    #[schema(example = "C...5678")]
+    pub contract_id: String,
+    /// New wasm hash for the clone (optional, defaults to original)
+    #[schema(example = "a1b2c3d4e5f6...")]
+    pub wasm_hash: Option<String>,
+    /// Override publisher (optional, defaults to current user)
+    pub publisher_id: Option<Uuid>,
+    /// Override category (optional)
+    #[schema(example = "DeFi")]
+    pub category: Option<String>,
+    /// Override tags (optional)
+    #[schema(example = json!(["yield", "fork", "optimized"]))]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Response from cloning a contract
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CloneContractResponse {
+    /// ID of the newly created clone
+    pub id: Uuid,
+    /// Contract ID (address) of the clone
+    pub contract_id: String,
+    /// Name of the cloned contract
+    pub name: String,
+    /// Link to the original contract
+    pub original_contract_id: Uuid,
+    /// Original contract name
+    pub original_contract_name: String,
+    /// Clone link (API endpoint)
+    pub clone_link: String,
+    /// Network where the clone is deployed
+    pub network: Network,
+    /// Whether the clone inherited ABI from original
+    pub inherited_abi: bool,
+    /// Creation timestamp
+    pub created_at: DateTime<Utc>,
+}
+
+/// Clone history record
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ContractCloneHistory {
+    pub id: Uuid,
+    pub parent_contract_id: Uuid,
+    pub cloned_contract_id: Uuid,
+    pub cloned_by: Option<Uuid>,
+    pub cloned_at: DateTime<Utc>,
+    pub metadata_overrides: Option<serde_json::Value>,
+    pub network: Network,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #499: Federated Registry Protocol Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Federation protocol version
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationProtocolVersion {
+    pub version: String,
+    pub supported_features: Vec<String>,
+}
+
+/// Federated registry information
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FederatedRegistry {
+    pub id: Uuid,
+    pub name: String,
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    pub is_active: bool,
+    pub federation_protocol_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub sync_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
+    pub contracts_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to register a new federated registry
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegisterFederatedRegistryRequest {
+    /// Name of the registry
+    #[schema(example = "Stellar Community Registry")]
+    pub name: String,
+    /// Base URL of the registry API
+    #[schema(example = "https://registry.example.com")]
+    pub base_url: String,
+    /// Public key for signature verification (optional)
+    #[schema(example = "ed25519:base64encodedkey...")]
+    pub public_key: Option<String>,
+    /// Federation protocol version (defaults to "1.0")
+    #[schema(example = "1.0")]
+    pub federation_protocol_version: Option<String>,
+}
+
+/// Response from registering a federated registry
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederatedRegistryResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub base_url: String,
+    pub is_active: bool,
+    pub federation_protocol_version: String,
+    pub registration_link: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Federation sync job status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FederationSyncJob {
+    pub id: Uuid,
+    pub registry_id: Uuid,
+    pub status: String,
+    pub contracts_synced: i32,
+    pub contracts_failed: i32,
+    pub duplicates_detected: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request to sync contracts from a federated registry
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SyncFederatedRegistryRequest {
+    /// Registry ID to sync from
+    pub registry_id: Uuid,
+    /// Sync only new contracts (default: false)
+    #[serde(default)]
+    pub incremental: bool,
+    /// Batch size for sync operations (default: 100)
+    #[serde(default = "default_sync_batch_size")]
+    pub batch_size: i32,
+}
+
+fn default_sync_batch_size() -> i32 {
+    100
+}
+
+/// Response from federation sync operation
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationSyncResponse {
+    pub job_id: Uuid,
+    pub registry_id: Uuid,
+    pub registry_name: String,
+    pub status: String,
+    pub contracts_synced: i32,
+    pub contracts_failed: i32,
+    pub duplicates_detected: i32,
+    pub sync_link: String,
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// Individual sync result record
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FederationSyncResult {
+    pub id: Uuid,
+    pub job_id: Uuid,
+    pub source_registry_id: Uuid,
+    pub source_contract_id: String,
+    pub local_contract_id: Option<Uuid>,
+    pub sync_action: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub synced_at: DateTime<Utc>,
+}
+
+/// Federation discovery response
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationDiscoveryResponse {
+    pub registries: Vec<FederatedRegistrySummary>,
+    pub total_count: i64,
+    pub discovered_at: DateTime<Utc>,
+}
+
+/// Summary of a federated registry for discovery
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederatedRegistrySummary {
+    pub id: Uuid,
+    pub name: String,
+    pub base_url: String,
+    pub contracts_count: i32,
+    pub protocol_version: String,
+    pub is_active: bool,
+}
+
+/// Duplicate detection result
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DuplicateDetectionResult {
+    pub source_contract_id: String,
+    pub source_registry: String,
+    pub local_match: Option<ContractDuplicateMatch>,
+    pub is_duplicate: bool,
+    pub detection_method: String,
+}
+
+/// Matched duplicate contract info
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractDuplicateMatch {
+    pub contract_id: Uuid,
+    pub contract_address: String,
+    pub name: String,
+    pub match_confidence: f64,
+    pub match_method: String,
+}
+
+/// Federation attribution info
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationAttribution {
+    pub source_registry_id: Uuid,
+    pub source_registry_name: String,
+    pub original_contract_id: String,
+    pub synced_at: DateTime<Utc>,
+    pub attribution_link: String,
+}
+
+/// Request to opt-in/out of federation for a contract
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationOptRequest {
+    /// Whether to allow this contract to be federated
+    pub allow_federation: bool,
+    /// Optional list of specific registries to allow/deny
+    pub registry_filters: Option<Vec<Uuid>>,
+}
+
+/// Federation configuration
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FederationProtocolConfig {
+    pub id: Uuid,
+    pub config_key: String,
+    pub config_value: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// List response for federated registries
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederatedRegistryListResponse {
+    pub registries: Vec<FederatedRegistry>,
+    pub total_count: i64,
+}
+
+/// Sync history response
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FederationSyncHistoryResponse {
+    pub jobs: Vec<FederationSyncJob>,
+    pub total_count: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY SCANNING TYPES (#498)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Security scanner configuration
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct SecurityScanner {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub scanner_type: String,
+    pub api_endpoint: Option<String>,
+    pub is_active: bool,
+    pub configuration: serde_json::Value,
+    pub timeout_seconds: i32,
+    pub max_concurrent_scans: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Security scan status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "scan_status_type", rename_all = "snake_case")]
+pub enum ScanStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Security issue severity
+#[derive(
+    Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq, PartialOrd,
+)]
+#[sqlx(type_name = "issue_severity_type", rename_all = "lowercase")]
+pub enum IssueSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl std::fmt::Display for IssueSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+/// Security issue status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "issue_status_type", rename_all = "snake_case")]
+pub enum IssueStatus {
+    Open,
+    Acknowledged,
+    Resolved,
+    FalsePositive,
+}
+
+/// Security scan result
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct SecurityScan {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub contract_version_id: Option<Uuid>,
+    pub scanner_id: Option<Uuid>,
+    pub status: ScanStatus,
+    pub scan_type: String,
+    pub triggered_by: Option<Uuid>,
+    pub triggered_by_event: Option<String>,
+    pub total_issues: i32,
+    pub critical_issues: i32,
+    pub high_issues: i32,
+    pub medium_issues: i32,
+    pub low_issues: i32,
+    pub scan_duration_ms: Option<i32>,
+    pub scanner_version: Option<String>,
+    pub scan_parameters: Option<serde_json::Value>,
+    pub scan_result_raw: Option<serde_json::Value>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Security issue found during a scan
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct SecurityIssue {
+    pub id: Uuid,
+    pub scan_id: Uuid,
+    pub contract_id: Uuid,
+    pub contract_version_id: Option<Uuid>,
+    pub title: String,
+    pub description: String,
+    pub severity: IssueSeverity,
+    pub status: IssueStatus,
+    pub category: Option<String>,
+    pub cwe_id: Option<String>,
+    pub cve_id: Option<String>,
+    pub source_file: Option<String>,
+    pub source_line_start: Option<i32>,
+    pub source_line_end: Option<i32>,
+    pub function_name: Option<String>,
+    pub code_snippet: Option<String>,
+    pub remediation: Option<String>,
+    pub remediation_code_example: Option<String>,
+    pub references: Option<Vec<String>>,
+    pub external_issue_id: Option<String>,
+    pub is_false_positive: bool,
+    pub false_positive_reason: Option<String>,
+    pub resolved_by: Option<Uuid>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Security score history for version tracking
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct SecurityScoreHistory {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub contract_version_id: Uuid,
+    pub overall_score: i32,
+    pub score_breakdown: Option<serde_json::Value>,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub scan_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request to trigger a security scan
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TriggerSecurityScanRequest {
+    pub contract_id: Uuid,
+    pub version: Option<String>,
+    pub scanner_ids: Option<Vec<Uuid>>,
+    pub scan_type: Option<String>,
+}
+
+/// Request to create/update a security scanner configuration
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateSecurityScannerRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub scanner_type: String,
+    pub api_endpoint: Option<String>,
+    pub api_key: Option<String>,
+    pub configuration: Option<serde_json::Value>,
+    pub timeout_seconds: Option<i32>,
+}
+
+/// Request to update security issue status
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateSecurityIssueRequest {
+    pub status: IssueStatus,
+    pub notes: Option<String>,
+}
+
+/// Security scan summary for a contract
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContractSecuritySummary {
+    pub contract_id: Uuid,
+    pub contract_name: String,
+    pub latest_scan: Option<SecurityScanSummary>,
+    pub total_scans: i64,
+    pub open_issues: i64,
+    pub critical_open: i64,
+    pub high_open: i64,
+    pub security_score: Option<i32>,
+}
+
+/// Summary of a single security scan
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct SecurityScanSummary {
+    pub id: Uuid,
+    pub status: ScanStatus,
+    pub scan_type: String,
+    pub total_issues: i32,
+    pub critical_issues: i32,
+    pub high_issues: i32,
+    pub medium_issues: i32,
+    pub low_issues: i32,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Security scan history response
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SecurityScanHistoryResponse {
+    pub scans: Vec<SecurityScanSummary>,
+    pub total_count: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTIFICATION/SUBSCRIPTION TYPES (#493)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Notification type
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "notification_type", rename_all = "snake_case")]
+pub enum NotificationType {
+    NewVersion,
+    VerificationStatus,
+    SecurityIssue,
+    SecurityScanCompleted,
+    BreakingChange,
+    Deprecation,
+    Maintenance,
+    CompatibilityIssue,
+}
+
+/// Notification channel
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "notification_channel", rename_all = "snake_case")]
+pub enum NotificationChannel {
+    Email,
+    Webhook,
+    Push,
+    InApp,
+}
+
+/// Notification frequency
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "notification_frequency", rename_all = "snake_case")]
+pub enum NotificationFrequency {
+    Realtime,
+    DailyDigest,
+    WeeklyDigest,
+}
+
+impl std::fmt::Display for NotificationFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Realtime => write!(f, "realtime"),
+            Self::DailyDigest => write!(f, "daily_digest"),
+            Self::WeeklyDigest => write!(f, "weekly_digest"),
+        }
+    }
+}
+
+/// Subscription status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "subscription_status", rename_all = "lowercase")]
+pub enum SubscriptionStatus {
+    Active,
+    Paused,
+    Unsubscribed,
+}
+
+/// Contract subscription
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ContractSubscription {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub contract_id: Uuid,
+    pub status: SubscriptionStatus,
+    pub notification_types: Vec<NotificationType>,
+    pub channels: Vec<NotificationChannel>,
+    pub frequency: NotificationFrequency,
+    pub min_severity: Option<IssueSeverity>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to subscribe to a contract
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SubscribeRequest {
+    pub contract_id: Uuid,
+    pub notification_types: Option<Vec<NotificationType>>,
+    pub channels: Option<Vec<NotificationChannel>>,
+    pub frequency: Option<NotificationFrequency>,
+    pub min_severity: Option<IssueSeverity>,
+}
+
+/// Request to update subscription preferences
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateSubscriptionRequest {
+    pub status: Option<SubscriptionStatus>,
+    pub notification_types: Option<Vec<NotificationType>>,
+    pub channels: Option<Vec<NotificationChannel>>,
+    pub frequency: Option<NotificationFrequency>,
+    pub min_severity: Option<IssueSeverity>,
+}
+
+/// User notification preferences
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct UserNotificationPreferences {
+    pub id: Uuid,
+    pub publisher_id: Uuid,
+    pub notification_frequency: NotificationFrequency,
+    pub notification_channels: Vec<NotificationChannel>,
+    pub email_notifications_enabled: bool,
+    pub webhook_url: Option<String>,
+    pub quiet_hours_start: Option<String>,
+    pub quiet_hours_end: Option<String>,
+    pub timezone: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to update user notification preferences
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateUserNotificationPreferencesRequest {
+    pub notification_frequency: Option<NotificationFrequency>,
+    pub notification_channels: Option<Vec<NotificationChannel>>,
+    pub email_notifications_enabled: Option<bool>,
+    pub webhook_url: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub quiet_hours_start: Option<String>,
+    pub quiet_hours_end: Option<String>,
+    pub timezone: Option<String>,
+}
+
+/// Webhook configuration
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct WebhookConfiguration {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub organization_id: Option<Uuid>,
+    pub name: String,
+    pub url: String,
+    pub notification_types: Vec<NotificationType>,
+    pub is_active: bool,
+    pub verify_ssl: bool,
+    pub custom_headers: Option<serde_json::Value>,
+    pub rate_limit_per_minute: Option<i32>,
+    pub total_deliveries: i32,
+    pub failed_deliveries: i32,
+    pub last_delivery_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to create a webhook
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateWebhookRequest {
+    pub name: String,
+    pub url: String,
+    pub notification_types: Vec<NotificationType>,
+    pub secret: Option<String>,
+    pub verify_ssl: Option<bool>,
+    pub custom_headers: Option<serde_json::Value>,
+}
+
+/// Notification queue item
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct NotificationQueueItem {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub notification_type: NotificationType,
+    pub title: String,
+    pub message: String,
+    pub contract_id: Uuid,
+    pub contract_version_id: Option<Uuid>,
+    pub security_issue_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
+    pub channels: Vec<NotificationChannel>,
+    pub status: String,
+    pub priority: i32,
+    pub scheduled_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// User's subscriptions list response
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UserSubscriptionsResponse {
+    pub subscriptions: Vec<ContractSubscriptionSummary>,
+    pub total_count: i64,
+}
+
+/// Summary of a contract subscription
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ContractSubscriptionSummary {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub contract_name: String,
+    pub contract_slug: Option<String>,
+    pub status: SubscriptionStatus,
+    pub notification_types: Vec<NotificationType>,
+    pub channels: Vec<NotificationChannel>,
+    pub frequency: NotificationFrequency,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Notification statistics
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct NotificationStatistics {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub contract_id: Option<Uuid>,
+    pub period_start: chrono::NaiveDate,
+    pub period_end: chrono::NaiveDate,
+    pub new_version_count: i32,
+    pub verification_status_count: i32,
+    pub security_issue_count: i32,
+    pub security_scan_completed_count: i32,
+    pub breaking_change_count: i32,
+    pub deprecation_count: i32,
+    pub maintenance_count: i32,
+    pub compatibility_issue_count: i32,
+    pub total_sent: i32,
+    pub total_delivered: i32,
+    pub total_failed: i32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ZERO-KNOWLEDGE PROOF VALIDATION SYSTEM (Issue #624)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Supported ZK proof systems
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "zk_proof_system", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ZkProofSystem {
+    Groth16,
+    Plonk,
+    Stark,
+    Marlin,
+    Fflonk,
+}
+
+impl std::fmt::Display for ZkProofSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ZkProofSystem::Groth16 => "groth16",
+            ZkProofSystem::Plonk   => "plonk",
+            ZkProofSystem::Stark   => "stark",
+            ZkProofSystem::Marlin  => "marlin",
+            ZkProofSystem::Fflonk  => "fflonk",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+/// Supported circuit languages / DSLs
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "zk_circuit_language", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ZkCircuitLanguage {
+    Circom,
+    Noir,
+    Leo,
+    Cairo,
+    Halo2,
+}
+
+/// ZK proof validation status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema, PartialEq)]
+#[sqlx(type_name = "zk_proof_status", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ZkProofStatus {
+    Pending,
+    Valid,
+    Invalid,
+    Error,
+}
+
+impl std::fmt::Display for ZkProofStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ZkProofStatus::Pending => "pending",
+            ZkProofStatus::Valid   => "valid",
+            ZkProofStatus::Invalid => "invalid",
+            ZkProofStatus::Error   => "error",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+/// A compiled ZK circuit registered for a contract
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ZkCircuit {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub language: ZkCircuitLanguage,
+    pub proof_system: ZkProofSystem,
+    /// Circuit source code / program text
+    pub circuit_source: String,
+    /// SHA-256 hash of the compiled circuit artifact
+    pub circuit_hash: String,
+    /// Serialised verification key (base64)
+    pub verification_key: String,
+    pub num_public_inputs: i32,
+    pub num_constraints: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+    pub compiled_at: Option<DateTime<Utc>>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body to register / compile a new circuit
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegisterCircuitRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub language: ZkCircuitLanguage,
+    pub proof_system: ZkProofSystem,
+    pub circuit_source: String,
+    /// Pre-computed verification key (base64)
+    pub verification_key: String,
+    pub num_public_inputs: i32,
+    pub num_constraints: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_by_address: Option<String>,
+}
+
+/// A ZK proof submitted for validation
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ZkProofSubmission {
+    pub id: Uuid,
+    pub circuit_id: Uuid,
+    pub contract_id: Uuid,
+    pub proof_data: String,
+    pub public_inputs: serde_json::Value,
+    pub status: ZkProofStatus,
+    pub prover_address: String,
+    pub purpose: Option<String>,
+    pub error_message: Option<String>,
+    pub verification_ms: Option<i64>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request body to submit a ZK proof for validation
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SubmitProofRequest {
+    pub circuit_id: Uuid,
+    pub proof_data: String,
+    pub public_inputs: Vec<String>,
+    pub prover_address: String,
+    pub purpose: Option<String>,
+}
+
+/// Result returned after proof validation
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ZkProofValidationResult {
+    pub proof_id: Uuid,
+    pub circuit_id: Uuid,
+    pub contract_id: Uuid,
+    pub status: ZkProofStatus,
+    pub valid: bool,
+    pub message: String,
+    pub verification_ms: Option<i64>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+/// Privacy-preserving aggregate analytics for a contract's ZK proof activity
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+pub struct ZkAnalyticsAggregate {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub circuit_id: Option<Uuid>,
+    pub bucket_hour: DateTime<Utc>,
+    pub proof_system: ZkProofSystem,
+    pub total_proofs: i64,
+    pub valid_proofs: i64,
+    pub invalid_proofs: i64,
+    pub error_proofs: i64,
+    pub avg_verify_ms: Option<rust_decimal::Decimal>,
+    pub p99_verify_ms: Option<rust_decimal::Decimal>,
+}
+
+/// Aggregated ZK analytics response (no individual prover data exposed)
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ZkAnalyticsSummary {
+    pub contract_id: Uuid,
+    pub total_proofs: i64,
+    pub valid_proofs: i64,
+    pub invalid_proofs: i64,
+    pub error_proofs: i64,
+    pub success_rate_pct: f64,
+    pub avg_verify_ms: Option<f64>,
+    pub circuits: Vec<ZkCircuitStats>,
+}
+
+/// Per-circuit statistics within the analytics summary
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ZkCircuitStats {
+    pub circuit_id: Uuid,
+    pub circuit_name: String,
+    pub proof_system: ZkProofSystem,
+    pub total_proofs: i64,
+    pub valid_proofs: i64,
+    pub success_rate_pct: f64,
+    pub avg_verify_ms: Option<f64>,
+}
+
+/// Circuit summary (safe to expose publicly — omits circuit_source & verification_key)
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ZkCircuitSummary {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub language: ZkCircuitLanguage,
+    pub proof_system: ZkProofSystem,
+    pub circuit_hash: String,
+    pub num_public_inputs: i32,
+    pub num_constraints: Option<i64>,
+    pub compiled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }

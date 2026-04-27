@@ -3,6 +3,7 @@ use crate::breaking_changes;
 use crate::custom_metrics_handlers;
 use crate::deprecation_handlers;
 use crate::handlers;
+use crate::interoperability_handlers;
 use crate::metrics_handler;
 use crate::recommendation_handlers;
 use crate::similarity_handlers;
@@ -14,7 +15,7 @@ use utoipa::OpenApi;
     paths(
         handlers::health_check,
         handlers::get_stats,
-        handlers::list_contracts,
+        handlers::list_contracts_openapi_marker,
         handlers::export_contract_metadata,
         handlers::get_contract_export_status,
         handlers::get_contracts_batch,
@@ -63,14 +64,8 @@ use utoipa::OpenApi;
         custom_metrics_handlers::record_metrics_batch,
         deprecation_handlers::get_deprecation_info,
         deprecation_handlers::deprecate_contract,
+        interoperability_handlers::get_contract_interoperability,
         metrics_handler::metrics_endpoint,
-        // Review system
-        handlers::reviews::get_reviews,
-        handlers::reviews::create_review,
-        handlers::reviews::vote_review,
-        handlers::reviews::flag_review,
-        handlers::reviews::moderate_review,
-        handlers::reviews::get_rating_stats,
     ),
     components(
         schemas(
@@ -96,6 +91,13 @@ use utoipa::OpenApi;
             GraphNode,
             GraphEdge,
             GraphResponse,
+            ProtocolComplianceStatus,
+            InteroperabilityCapabilityKind,
+            InteroperabilityProtocolMatch,
+            InteroperabilityCapability,
+            InteroperabilitySuggestion,
+            InteroperabilitySummary,
+            ContractInteroperabilityResponse,
             PublishRequest,
             MigrationScript,
             DeploymentEnvironment,

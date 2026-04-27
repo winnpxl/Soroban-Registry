@@ -5,27 +5,23 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
   Network,
-  DependencyTreeNode,
-  GraphNode,
-  GraphEdge,
   ContractVersion,
   ContractChangelogEntry,
 } from "@/lib/api";
 import ExampleGallery from "@/components/ExampleGallery";
-import DependencyGraph from "@/components/DependencyGraph";
 import {
   ArrowLeft,
   CheckCircle2,
   Globe,
   Tag,
   Search,
-  BarChart3,
   History,
   Database,
-  Code2,
   Layers,
-  MessageSquare,
+  GitCompare,
+  Share2,
 } from "lucide-react";
+
 import Link from "next/link";
 import { useCopy } from "@/hooks/useCopy";
 import CodeCopyButton from "@/components/CodeCopyButton";
@@ -40,56 +36,28 @@ import DeprecationBanner from "@/components/DeprecationBanner";
 import ReleaseNotesPanel from "@/components/ReleaseNotesPanel";
 import ContractComments from "@/components/ContractComments";
 import { useContractAutoRefresh } from "@/hooks/useContractAutoRefresh";
+import { ContractTimeline } from "@/components/contracts/contract-timeline";
+import ContractInteractionFlow from "@/components/contracts/ContractInteractionFlow";
+import ContractAbiMethodExplorer from "@/components/contracts/ContractAbiMethodExplorer";
+
 
 const NETWORKS: Network[] = ["mainnet", "testnet", "futurenet"];
-const TAB_IDS = ["overview", "abi", "source", "deployments", "analytics", "history", "discussion"] as const;
+const TAB_IDS = [
+  "overview",
+  "abi",
+  "deployments",
+  "interactions",
+  "verification",
+  "history",
+] as const;
 type TabId = (typeof TAB_IDS)[number];
+
 
 // TODO: Replace with real API call when maintenance endpoint is available
 const maintenanceStatus: { is_maintenance: boolean; current_window: null } = {
   is_maintenance: false,
   current_window: null,
 };
-
-/** Flatten a recursive DependencyTreeNode[] into GraphNode[] + GraphEdge[]. */
-function flattenDependencyTree(
-  tree: DependencyTreeNode | DependencyTreeNode[],
-  network: Network = "mainnet"
-): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const nodes: GraphNode[] = [];
-  const edges: GraphEdge[] = [];
-  const seen = new Set<string>();
-
-  function walk(node: DependencyTreeNode, parentId?: string) {
-    if (!seen.has(node.contract_id)) {
-      seen.add(node.contract_id);
-      nodes.push({
-        id: node.contract_id,
-        contract_id: node.contract_id,
-        name: node.name,
-        network,
-        is_verified: false,
-        tags: [],
-      });
-    }
-    if (parentId) {
-      edges.push({
-        source: parentId,
-        target: node.contract_id,
-        dependency_type: node.constraint_to_parent || "dependency",
-      });
-    }
-    for (const child of node.dependencies) {
-      walk(child, node.contract_id);
-    }
-  }
-
-  const roots = Array.isArray(tree) ? tree : [tree];
-  for (const root of roots) {
-    walk(root);
-  }
-  return { nodes, edges };
-}
 
 function normalizeRawSourceUrl(input: string): string {
   try {
@@ -175,6 +143,8 @@ function ContractDetailsContent() {
   const id = Array.isArray(idParam) ? idParam[0] : idParam;
   const { copy: copyHeader, copied: copiedHeader } = useCopy();
   const { copy: copySidebar, copied: copiedSidebar } = useCopy();
+  const { copy: copySourceCode, copied: copiedSourceCode, isCopying: isCopyingSourceCode } = useCopy();
+  const { copy: copyShareLink, copied: copiedShareLink } = useCopy();
   const networkFromUrl = searchParams?.get("network") as Network | null;
   const [selectedNetwork, setSelectedNetwork] = useState<Network>(
     networkFromUrl && NETWORKS.includes(networkFromUrl) ? networkFromUrl : "mainnet"
@@ -182,15 +152,18 @@ function ContractDetailsContent() {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [tabSearch, setTabSearch] = useState("");
 
-  const tabMeta: Record<TabId, { label: string; icon: React.ComponentType<{ className?: string }> }> = {
+  const tabMeta: Record<
+    TabId,
+    { label: string; icon: React.ComponentType<{ className?: string }> }
+  > = {
     overview: { label: "Overview", icon: Layers },
     abi: { label: "ABI", icon: Database },
-    source: { label: "Source Code", icon: Code2 },
     deployments: { label: "Deployments", icon: Globe },
-    analytics: { label: "Analytics", icon: BarChart3 },
+    interactions: { label: "Interactions", icon: Share2 },
+    verification: { label: "Verification", icon: CheckCircle2 },
     history: { label: "History", icon: History },
-    discussion: { label: "Discussion", icon: MessageSquare },
   };
+
 
   // Subscribe to real-time contract updates
   useContractAutoRefresh(id);
@@ -205,7 +178,7 @@ function ContractDetailsContent() {
     enabled: !!id,
   });
 
-  const { data: dependencies, isLoading: depsLoading } = useQuery({
+  useQuery({
     queryKey: ["contract-dependencies", id],
     queryFn: () => api.getContractDependencies(id!),
     enabled: !!id && !!contract && activeTab === "overview",
@@ -214,7 +187,7 @@ function ContractDetailsContent() {
   const { data: versions = [] } = useQuery({
     queryKey: ["contract-versions", id],
     queryFn: () => api.getContractVersions(id!),
-    enabled: !!id && !!contract && ["source", "deployments", "history", "abi"].includes(activeTab),
+    enabled: !!id && !!contract && ["deployments", "history", "abi"].includes(activeTab),
   });
 
   const latestVersion = useMemo(() => {
@@ -233,7 +206,13 @@ function ContractDetailsContent() {
   const { data: analyticsData } = useQuery({
     queryKey: ["contract-analytics-summary", id],
     queryFn: () => api.getContractAnalytics(id!),
-    enabled: !!id && !!contract && ["analytics", "deployments"].includes(activeTab),
+    enabled: !!id && !!contract && ["interactions", "deployments"].includes(activeTab),
+  });
+
+  const { data: interactionsData } = useQuery({
+    queryKey: ["contract-interactions", id],
+    queryFn: () => api.getContractInteractions(id!, { limit: 10, offset: 0 }),
+    enabled: !!id && !!contract && activeTab === "interactions",
   });
 
   const { data: changelog } = useQuery({
@@ -258,11 +237,6 @@ function ContractDetailsContent() {
     },
     enabled: !!id && !!contract && activeTab === "source" && !!sourceQueryUrl,
   });
-
-  const depGraph = useMemo(
-    () => (dependencies ? flattenDependencyTree(dependencies as DependencyTreeNode | DependencyTreeNode[], selectedNetwork) : null),
-    [dependencies, selectedNetwork]
-  );
 
   const loweredSearch = tabSearch.trim().toLowerCase();
   const filteredVersions = useMemo(() => {
@@ -377,8 +351,38 @@ function ContractDetailsContent() {
             <div className="flex items-center gap-3 text-muted-foreground">
               <span className="flex items-center gap-2 font-mono bg-accent px-2 py-1 rounded-lg text-sm">
                 <span>{displayContractId}</span>
-                <CodeCopyButton copied={copiedHeader} onCopy={() => copyHeader(displayContractId)} />
+                <CodeCopyButton
+                  copied={copiedHeader}
+                  onCopy={() =>
+                    copyHeader(displayContractId, {
+                      successEventName: 'contract_address_copied',
+                      failureEventName: 'contract_address_copy_failed',
+                      successMessage: 'Contract address copied',
+                      failureMessage: 'Unable to copy contract address',
+                      analyticsParams: { contract_id: contract.id, location: 'header' },
+                    })
+                  }
+                  idleLabel="Copy"
+                  copiedLabel="Copied"
+                />
               </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const url = typeof window !== 'undefined' ? window.location.href : `${contract.id}`;
+                  copyShareLink(url, {
+                    successEventName: 'contract_share_link_copied',
+                    failureEventName: 'contract_share_link_copy_failed',
+                    successMessage: 'Contract link copied',
+                    failureMessage: 'Unable to copy contract link',
+                    analyticsParams: { contract_id: contract.id },
+                  });
+                }}
+                className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-semibold text-foreground hover:bg-accent transition-colors"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                {copiedShareLink ? 'Link Copied' : 'Share'}
+              </button>
               {displayVerified && (
                 <span className="flex items-center gap-1 text-green-600 dark:text-green-400 text-sm font-medium">
                   <CheckCircle2 className="w-4 h-4" />
@@ -410,11 +414,18 @@ function ContractDetailsContent() {
 
           <div className="flex gap-2">
             <Link
-              href={`/contracts/${id}/review`}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground font-semibold hover:opacity-90 transition-all shadow-lg shadow-primary/20"
+              href={`/compare?contracts=${contract.id}`}
+              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
             >
-              <MessageSquare className="w-4 h-4" />
-              Team Review
+              <GitCompare className="h-4 w-4" />
+              Compare
+            </Link>
+            <Link
+              href={`/contracts/${id}/compatibility`}
+              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+            >
+              <GitCompare className="h-4 w-4" />
+              Interoperability
             </Link>
           </div>
         </div>
@@ -493,30 +504,51 @@ function ContractDetailsContent() {
         {activeTab === "overview" && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 space-y-6">
-              {depsLoading ? (
-                <section className="bg-card rounded-2xl p-8 border border-border">
-                  <div className="animate-pulse space-y-4">
-                    <div className="h-8 bg-muted rounded w-1/3" />
-                    <div className="h-96 bg-muted rounded-lg" />
-                  </div>
-                </section>
-              ) : depGraph && depGraph.nodes.length > 0 ? (
-                <section className="bg-card rounded-2xl border border-border p-4 md:p-6">
-                  <h2 className="text-xl font-semibold text-foreground mb-4">Dependency Graph</h2>
-                  <div className="h-[520px]">
-                    <DependencyGraph nodes={depGraph.nodes} edges={depGraph.edges} searchQuery={tabSearch} />
-                  </div>
-                </section>
-              ) : (
-                <section className="bg-card rounded-2xl border border-border p-6">
-                  <h2 className="text-xl font-semibold text-foreground mb-2">Dependency Graph</h2>
-                  <p className="text-sm text-muted-foreground">No dependency graph available for this contract.</p>
-                </section>
-              )}
-
               <section>
                 <ExampleGallery contractId={contract.id} />
               </section>
+
+              <section className="bg-card rounded-2xl border border-border p-6">
+                <h3 className="font-semibold text-foreground mb-4">Contract Metadata</h3>
+                <dl className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                  <div>
+                    <dt className="text-muted-foreground">Name</dt>
+                    <dd className="font-medium text-foreground">{contract.name}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Author</dt>
+                    <dd className="font-medium text-foreground break-all">{contract.publisher_id}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Network</dt>
+                    <dd className="font-medium text-foreground capitalize">{selectedNetwork}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Category</dt>
+                    <dd className="font-medium text-foreground">{contract.category ?? 'Uncategorized'}</dd>
+                  </div>
+                  <div className="sm:col-span-2">
+                    <dt className="text-muted-foreground">Description</dt>
+                    <dd className="font-medium text-foreground">{contract.description ?? 'No description provided.'}</dd>
+                  </div>
+                  {sourceUrl && (
+                    <div className="sm:col-span-2">
+                      <dt className="text-muted-foreground">Links</dt>
+                      <dd>
+                        <a
+                          href={sourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-primary hover:underline break-all"
+                        >
+                          Source repository
+                        </a>
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+              </section>
+
             </div>
 
             <div className="space-y-6">
@@ -531,7 +563,20 @@ function ContractDetailsContent() {
                     <dt className="text-muted-foreground">Address</dt>
                     <dd className="flex items-center justify-between gap-2 font-mono text-xs text-foreground break-all">
                       <span>{displayContractId}</span>
-                      <CodeCopyButton copied={copiedSidebar} onCopy={() => copySidebar(displayContractId)} />
+                      <CodeCopyButton
+                        copied={copiedSidebar}
+                        onCopy={() =>
+                          copySidebar(displayContractId, {
+                            successEventName: 'contract_address_copied',
+                            failureEventName: 'contract_address_copy_failed',
+                            successMessage: 'Contract address copied',
+                            failureMessage: 'Unable to copy contract address',
+                            analyticsParams: { contract_id: contract.id, location: 'sidebar' },
+                          })
+                        }
+                        idleLabel="Copy"
+                        copiedLabel="Copied"
+                      />
                     </dd>
                   </div>
                   <div>
@@ -556,58 +601,96 @@ function ContractDetailsContent() {
                 </div>
               </Link>
 
-              <FormalVerificationPanel contractId={contract.id} />
             </div>
           </div>
         )}
 
-        {activeTab === "abi" && (
-          <section className="bg-card rounded-2xl border border-border p-6 space-y-4">
-            <h2 className="text-xl font-semibold text-foreground">ABI</h2>
-            {abiLoading ? (
-              <div className="h-64 animate-pulse bg-muted rounded" />
-            ) : (
-              <pre className="overflow-x-auto rounded-xl border border-border bg-background p-4 text-xs leading-6">
-                {JSON.stringify(abiResponse?.abi ?? {}, null, 2)
-                  .split("\n")
-                  .filter((line) => !loweredSearch || line.toLowerCase().includes(loweredSearch))
-                  .map((line, idx) => (
-                    <div key={`${idx}-${line.slice(0, 12)}`}>
-                      {line || " "}
+        {activeTab === "interactions" && (
+          <div className="space-y-6">
+            <section className="bg-card rounded-2xl border border-border p-6">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-xl font-semibold text-foreground">Interaction Flow Diagram</h2>
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <span className="w-3 h-3 rounded-full bg-primary/20 border border-primary/50" />
+                  <span>Interactive Flow</span>
+                </div>
+              </div>
+              <p className="text-sm text-muted-foreground mb-6">
+                Explore the cross-contract call graph centered on this contract. Zoom, pan, and filter to understand complex relationships.
+              </p>
+              <ContractInteractionFlow contractId={id} />
+            </section>
+
+            <section className="bg-card rounded-2xl border border-border p-6">
+              <h3 className="text-lg font-semibold text-foreground mb-4">Interaction Statistics</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+                <div className="rounded-xl border border-border p-3 bg-background">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wide">Recent calls</p>
+                  <p className="text-2xl font-bold text-foreground">{interactionsData?.total ?? 0}</p>
+                </div>
+                <div className="rounded-xl border border-border p-3 bg-background">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wide">Unique users</p>
+                  <p className="text-2xl font-bold text-foreground">{analyticsData?.interactors.unique_count ?? 0}</p>
+                </div>
+                <div className="rounded-xl border border-border p-3 bg-background">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wide">Error rate</p>
+                  <p className="text-2xl font-bold text-foreground">N/A</p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {(interactionsData?.items ?? []).map((item) => (
+                  <div key={item.id} className="rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-xs text-foreground">{item.method ?? 'unknown_method'}</span>
+                      <time className="text-xs text-muted-foreground">{new Date(item.created_at).toLocaleString()}</time>
                     </div>
-                  ))}
-              </pre>
-            )}
-          </section>
+                    <p className="text-xs text-muted-foreground break-all mt-1">{item.account ?? 'Unknown account'}</p>
+                  </div>
+                ))}
+                {(interactionsData?.items?.length ?? 0) === 0 && (
+                  <p className="text-sm text-muted-foreground">No recent interactions found.</p>
+                )}
+              </div>
+            </section>
+          </div>
         )}
 
-        {activeTab === "source" && (
-          <section className="bg-card rounded-2xl border border-border p-6 space-y-4">
+        {activeTab === "abi" && (
+          <section className="bg-card rounded-2xl border border-border p-6 space-y-6">
             <div className="flex items-center justify-between gap-4">
-              <h2 className="text-xl font-semibold text-foreground">Source Code</h2>
-              {sourceUrl && (
-                <a
-                  href={sourceUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-sm text-primary hover:underline"
-                >
-                  Open Source URL
-                </a>
+              <div>
+                <h2 className="text-xl font-semibold text-foreground">ABI Method Explorer</h2>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Browse contract methods, input parameters, simulate calls, and copy SDK snippets.
+                </p>
+              </div>
+              {abiResponse?.abi != null && (
+                <details className="shrink-0">
+                  <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground transition-colors select-none">
+                    View raw JSON
+                  </summary>
+                  <div className="absolute right-6 z-20 mt-2 w-[min(600px,90vw)] max-h-96 overflow-auto rounded-xl border border-border bg-zinc-950 p-4 shadow-2xl">
+                    <pre className="text-[11px] leading-5 text-zinc-300 font-mono">
+                      {JSON.stringify(abiResponse.abi, null, 2)}
+                    </pre>
+                  </div>
+                </details>
               )}
             </div>
 
-            {!sourceUrl && (
-              <p className="text-sm text-muted-foreground">No source URL available for the latest version.</p>
+            {abiLoading ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="h-14 animate-pulse bg-muted rounded-xl" />
+                ))}
+              </div>
+            ) : (
+              <ContractAbiMethodExplorer
+                abi={abiResponse?.abi}
+                contractId={displayContractId}
+              />
             )}
-
-            {sourceLoading && <div className="h-64 animate-pulse bg-muted rounded" />}
-            {sourceError && (
-              <p className="text-sm text-amber-500">
-                Unable to fetch source code from remote URL. You can still open the source URL directly.
-              </p>
-            )}
-            {sourceCode && <HighlightedRustCode code={sourceCode} query={tabSearch} />}
           </section>
         )}
 
@@ -631,6 +714,19 @@ function ContractDetailsContent() {
             </div>
 
             <div className="space-y-3">
+              <h3 className="text-sm font-semibold text-foreground uppercase tracking-wide">Network Deployments</h3>
+              <div className="space-y-3">
+                {Object.entries(contract.network_configs ?? {}).map(([network, config]) => (
+                  <div key={network} className="rounded-xl border border-border p-4 bg-background">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-semibold text-foreground capitalize">{network}</p>
+                      <time className="text-xs text-muted-foreground">{new Date(contract.updated_at).toLocaleString()}</time>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1 font-mono break-all">{config.contract_id}</p>
+                  </div>
+                ))}
+              </div>
+
               <h3 className="text-sm font-semibold text-foreground uppercase tracking-wide">Deployment Timeline</h3>
               <div className="space-y-3">
                 {filteredVersions.map((version) => (
@@ -653,23 +749,46 @@ function ContractDetailsContent() {
           </section>
         )}
 
-        {activeTab === "analytics" && (
-          <div className="space-y-6">
-            <section className="bg-card rounded-2xl border border-border p-6">
-              <h2 className="text-xl font-semibold text-foreground mb-4">Usage Analytics</h2>
-              <p className="text-sm text-muted-foreground">
-                Use the filters inside the analytics tables and charts below to search account and method activity.
-              </p>
-            </section>
-            <InteractionHistorySection contractId={contract.id} />
-            <CustomMetricsPanel contractId={contract.id} />
-          </div>
+        {activeTab === "verification" && (
+          <section className="space-y-4">
+            <div className="bg-card rounded-2xl border border-border p-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-xl font-semibold text-foreground">Verification Status</h2>
+                <span className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-semibold ${displayVerified ? 'border-green-500/30 bg-green-500/10 text-green-600' : 'border-amber-500/30 bg-amber-500/10 text-amber-600'}`}>
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  {displayVerified ? 'Verified' : 'Pending Verification'}
+                </span>
+              </div>
+              <dl className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                <div>
+                  <dt className="text-muted-foreground">Auditor</dt>
+                  <dd className="font-medium text-foreground">Automated verification pipeline</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Report</dt>
+                  <dd>
+                    <Link href="/verification-status" className="text-primary hover:underline">Open verification report</Link>
+                  </dd>
+                </div>
+              </dl>
+            </div>
+            <FormalVerificationPanel contractId={contract.id} />
+          </section>
         )}
 
         {activeTab === "history" && (
           <div className="space-y-6">
             <section className="bg-card rounded-2xl border border-border p-6 space-y-4">
-              <h2 className="text-xl font-semibold text-foreground">Update History</h2>
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-xl font-semibold text-foreground">Update History</h2>
+                <Link
+                  href={`/contracts/${id}/diff`}
+                  className="flex items-center gap-1.5 rounded-xl border border-border bg-background px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                >
+                  <GitCompare size={14} />
+                  View code diff
+                </Link>
+              </div>
               <div className="space-y-3">
                 {filteredHistory.map((entry: ContractChangelogEntry) => (
                   <article key={`${entry.version}-${entry.created_at}`} className="rounded-xl border border-border p-4 bg-background">
@@ -701,11 +820,6 @@ function ContractDetailsContent() {
           </div>
         )}
 
-        {activeTab === "discussion" && (
-          <section className="bg-card rounded-2xl border border-border p-6">
-            <ContractComments contractId={contract.id} />
-          </section>
-        )}
       </div>
     </div>
   );

@@ -239,7 +239,7 @@ impl Validatable for ContractExportRequest {
                 Ok(())
             });
             for (index, category) in categories.iter().enumerate() {
-                builder.check(format!("filters.categories[{index}]"), || {
+                builder.check(&format!("filters.categories[{index}]"), || {
                     validate_length(category, 1, 100)
                 });
             }
@@ -655,6 +655,7 @@ mod tests {
             source_url: Some("https://github.com/user/repo".to_string()),
             publisher_address: valid_stellar_address(),
             dependencies: vec![],
+            is_cicd: false,
         };
 
         assert!(req.validate().is_ok());
@@ -673,6 +674,7 @@ mod tests {
             source_url: None,
             publisher_address: valid_stellar_address(),
             dependencies: vec![],
+            is_cicd: false,
         };
 
         let result = req.validate();
@@ -694,6 +696,7 @@ mod tests {
             source_url: None,
             publisher_address: valid_stellar_address(),
             dependencies: vec![],
+            is_cicd: false,
         };
 
         let result = req.validate();
@@ -716,6 +719,7 @@ mod tests {
             publisher_address: "  gdlzfc3syjydzt7k67vz75hpjvieuvnixf47zg2fb2rmqqvu2hhgcysc  "
                 .to_string(),
             dependencies: vec![],
+            is_cicd: false,
         };
 
         req.sanitize();

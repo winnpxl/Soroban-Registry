@@ -1,8 +1,5 @@
 use axum::{
-    extract::{FromRequestParts, Request},
-    http::{header, request::Parts, StatusCode},
-    middleware::Next,
-    response::Response,
+    extract::Request, http::header, http::StatusCode, middleware::Next, response::Response,
 };
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -11,6 +8,7 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use uuid::Uuid;
 
 use crate::{
     error::ApiError,
@@ -20,9 +18,61 @@ use uuid::Uuid;
 
 pub const MIN_JWT_SECRET_LEN: usize = 32;
 
+/// Authenticated user extracted from a valid Bearer JWT.
+/// The `sub` claim is expected to be the publisher's Stellar address,
+/// and `publisher_id` is derived by looking up the publisher in the DB.
+/// For simplicity (matching the existing subscription_handlers pattern),
+/// we store the sub as a string and expose a UUID parsed from it when possible,
+/// falling back to a nil UUID so callers can handle the error themselves.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedUser {
+    /// The `sub` claim from the JWT (Stellar address / publisher identifier)
+    pub stellar_address: String,
+    /// Publisher UUID — parsed from sub if it is a UUID, otherwise nil
+    pub publisher_id: uuid::Uuid,
+    /// Full claims for callers that need them
+    pub claims: AuthClaims,
+}
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for AuthenticatedUser
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_header = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        let auth_manager =
+            AuthManager::from_env().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let claims = auth_manager
+            .validate_jwt(auth_header)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        let publisher_id = uuid::Uuid::parse_str(&claims.sub)
+            .unwrap_or(uuid::Uuid::nil());
+
+        Ok(AuthenticatedUser {
+            stellar_address: claims.sub.clone(),
+            publisher_id,
+            claims,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthClaims {
     pub sub: String,
+    pub publisher_id: uuid::Uuid,
     pub iat: i64,
     pub exp: i64,
     #[serde(default)]
@@ -30,6 +80,8 @@ pub struct AuthClaims {
     #[serde(default)]
     pub admin: bool,
 }
+
+pub type AuthenticatedUser = AuthClaims;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
@@ -121,6 +173,7 @@ impl AuthManager {
         address: &str,
         public_key_hex: &str,
         signature_hex: &str,
+        publisher_id: uuid::Uuid,
     ) -> Result<String, &'static str> {
         let challenge = self
             .challenges
@@ -142,6 +195,7 @@ impl AuthManager {
         let exp = (Utc::now() + Duration::hours(24)).timestamp();
         let claims = AuthClaims {
             sub: address.to_string(),
+            publisher_id,
             iat,
             exp,
             role: None,
@@ -304,7 +358,7 @@ mod tests {
         let nonce = auth.create_challenge(&vk_hex);
         let sig = sk.sign(nonce.as_bytes());
         let token = auth
-            .verify_and_issue_jwt(&vk_hex, &vk_hex, &hex_encode(&sig.to_bytes()))
+            .verify_and_issue_jwt(&vk_hex, &vk_hex, &hex_encode(&sig.to_bytes()), uuid::Uuid::nil())
             .expect("jwt must be issued");
         let claims = auth.validate_jwt(&token).expect("token must be valid");
         assert_eq!(claims.sub, vk_hex);
@@ -319,9 +373,9 @@ mod tests {
         let nonce = auth.create_challenge(&vk_hex);
         let sig = sk.sign(nonce.as_bytes());
         let sig_hex = hex_encode(&sig.to_bytes());
-        let first = auth.verify_and_issue_jwt(&vk_hex, &vk_hex, &sig_hex);
+        let first = auth.verify_and_issue_jwt(&vk_hex, &vk_hex, &sig_hex, uuid::Uuid::nil());
         assert!(first.is_ok());
-        let second = auth.verify_and_issue_jwt(&vk_hex, &vk_hex, &sig_hex);
+        let second = auth.verify_and_issue_jwt(&vk_hex, &vk_hex, &sig_hex, uuid::Uuid::nil());
         assert!(second.is_err());
     }
 

@@ -100,9 +100,19 @@ pub async fn verify_challenge(
             "address, public_key and signature are required",
         ));
     }
+    // Fetch publisher_id from address
+    let publisher_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM publishers WHERE address = $1"
+    )
+    .bind(&payload.address)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "PublisherNotFound", "Publisher not registered"))?;
+
     let mut mgr = state.auth_mgr.write().unwrap();
     let token = mgr
-        .verify_and_issue_jwt(&payload.address, &payload.public_key, &payload.signature)
+        .verify_and_issue_jwt(&payload.address, &payload.public_key, &payload.signature, publisher_id)
         .map_err(|_| {
             ApiError::new(
                 StatusCode::UNAUTHORIZED,
@@ -134,7 +144,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use std::time::Instant;
 
-    fn test_app_state() -> AppState {
+    async fn test_app_state() -> AppState {
         let db = sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://localhost/test")
@@ -145,10 +155,11 @@ mod tests {
         )));
         let resource_mgr = Arc::new(RwLock::new(ResourceManager::new()));
         let (job_engine, _rx) = soroban_batch::engine::JobEngine::new();
+        let (event_broadcaster, _) = tokio::sync::broadcast::channel(100);
         AppState {
             db,
             started_at: Instant::now(),
-            cache: Arc::new(CacheLayer::new(CacheConfig::default())),
+            cache: Arc::new(CacheLayer::new(CacheConfig::default()).await),
             registry,
             job_engine: Arc::new(job_engine),
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -156,12 +167,14 @@ mod tests {
             auth_mgr,
             resource_mgr,
             contract_events: Arc::new(ContractEventHub::from_env()),
+            source_storage: Arc::new(shared::source_storage::SourceStorage::new().await.unwrap()),
+            event_broadcaster,
         }
     }
 
     #[tokio::test]
     async fn challenge_returns_nonce_for_address() {
-        let state = test_app_state();
+        let state = test_app_state().await;
         let query = ChallengeQuery {
             address: "GABCDEF".to_string(),
         };
@@ -175,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn challenge_rejects_empty_address() {
-        let state = test_app_state();
+        let state = test_app_state().await;
         let query = ChallengeQuery {
             address: "   ".to_string(),
         };
@@ -185,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_issues_jwt_when_signature_valid() {
-        let state = test_app_state();
+        let state = test_app_state().await;
         let key = SigningKey::from_bytes(&[1u8; 32]);
         let address_hex = hex::encode(key.verifying_key().as_bytes());
 

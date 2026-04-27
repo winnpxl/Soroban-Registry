@@ -2,6 +2,7 @@ use crate::state::{AppState, RealtimeEvent};
 use chrono::Utc;
 use shared::models::Network;
 
+#[allow(dead_code)]
 pub fn emit_contract_deployment(
     state: &AppState,
     contract_id: String,
@@ -22,6 +23,7 @@ pub fn emit_contract_deployment(
     state.contract_events.publish(event);
 }
 
+#[allow(dead_code)]
 pub fn emit_contract_update(
     state: &AppState,
     contract_id: String,

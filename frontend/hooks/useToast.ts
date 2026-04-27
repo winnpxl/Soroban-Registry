@@ -5,18 +5,22 @@ import { ToastContext, ToastContextValue } from '@/providers/ToastProvider';
 
 export function useToast(): ToastContextValue {
   const context = useContext(ToastContext);
-  
+
   if (!context) {
-    // Return dummy functions if used outside provider (e.g. during SSR/prerender)
+    // During SSR prerendering there is no ToastProvider in scope.
+    // Return a no-op fallback — all real call-sites are 'use client'
+    // components so this path is never hit at runtime.
+    const noop = () => {};
     return {
-      showInfo: () => {},
-      showSuccess: () => {},
-      showWarning: () => {},
-      showError: () => {},
-      removeToast: () => {},
       toasts: [],
+      showToast: noop,
+      dismissToast: noop,
+      showError: noop,
+      showSuccess: noop,
+      showWarning: noop,
+      showInfo: noop,
     };
   }
-  
+
   return context;
 }

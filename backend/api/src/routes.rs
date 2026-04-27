@@ -1,11 +1,16 @@
 #[cfg(feature = "openapi")]
 use crate::openapi;
 use crate::{
-    ab_test_handlers, analytics_handlers, auth, auth_handlers, batch_verify_handlers, breaking_changes,
-    canary_handlers, category_handlers, collaborative_reviews, compatibility_testing_handlers,
-    contract_events, custom_metrics_handlers, deprecation_handlers, handlers, metrics_handler,
-    migration_handlers, org_handlers, performance_handlers, resource_handlers, similarity_handlers,
-    simulation_handlers, state::AppState, websocket,
+    ab_test_handlers, analytics_handlers, auth, auth_handlers, batch_verify_handlers,
+    breaking_changes, canary_handlers, category_handlers, clone_federation_handlers,
+    compatibility_testing_handlers, contract_events, custom_metrics_handlers, deprecation_handlers,
+    formal_verification_handlers, gas_estimation_handlers, governance_handlers,
+    graph_analysis_handlers, handlers, interoperability_handlers, metrics_handler,
+    migration_handlers, mutation_testing_handlers, org_handlers, patch_handlers,
+    performance_handlers, plugin_marketplace_handlers, publisher_verification_handlers,
+    recommendation_handlers, resource_handlers, security_scan_handlers, similarity_handlers,
+    simulation_handlers, state::AppState, subscription_handlers, verification_handlers, websocket,
+    zk_proof_handlers,
 };
 
 use axum::{
@@ -28,12 +33,29 @@ pub fn auth_routes() -> Router<AppState> {
         .route("/api/auth/verify", post(auth_handlers::verify_challenge))
 }
 
+pub fn validator_routes() -> Router<AppState> {
+    Router::new()
+}
+
+pub fn plugin_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/plugins/marketplace",
+            get(plugin_marketplace_handlers::get_marketplace),
+        )
+        .route(
+            "/api/plugins/:name/:version",
+            get(plugin_marketplace_handlers::get_plugin_manifest),
+        )
+}
+
 pub fn contract_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/contracts",
             get(handlers::list_contracts).post(handlers::publish_contract),
         )
+        .route("/api/contracts/tags", get(handlers::list_tags))
         .route(
             "/api/contracts/export",
             post(handlers::export_contract_metadata),
@@ -66,6 +88,7 @@ pub fn contract_routes() -> Router<AppState> {
             "/api/contracts/trending",
             get(handlers::get_trending_contracts),
         )
+        .route("/contracts/trending", get(handlers::get_trending_contracts))
         .route("/api/contracts/batch", post(handlers::get_contracts_batch))
         .route("/contracts/batch", post(handlers::get_contracts_batch))
         .route("/api/contracts/graph", get(handlers::get_contract_graph))
@@ -174,11 +197,17 @@ pub fn contract_routes() -> Router<AppState> {
         )
         .route(
             "/api/analytics/dashboard",
-            get(analytics_handlers::get_analytics_summary),
+            get(analytics_handlers::get_analytics_dashboard),
         )
         .route(
             "/api/contracts/:id/dependencies",
-            get(crate::dependency_handlers::get_contract_dependencies),
+            get(crate::dependency_handlers::get_contract_dependencies)
+                // Issue #610: POST endpoint to declare/save dependencies
+                .post(dependency_handlers::declare_contract_dependencies),
+        )
+        .route(
+            "/api/contracts/:id/graph",
+            get(handlers::get_contract_local_graph),
         )
         .route(
             "/api/contracts/:id/trust-score",
@@ -201,7 +230,15 @@ pub fn contract_routes() -> Router<AppState> {
             get(recommendation_handlers::get_contract_recommendations),
         )
         .route(
+            "/api/contracts/:id/related",
+            get(recommendation_handlers::get_contract_recommendations),
+        )
+        .route(
             "/contracts/:id/recommendations",
+            get(recommendation_handlers::get_contract_recommendations),
+        )
+        .route(
+            "/contracts/:id/related",
             get(recommendation_handlers::get_contract_recommendations),
         )
         .route(
@@ -216,6 +253,10 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/similarity/analyze",
             post(similarity_handlers::analyze_contract_similarity_batch),
+        )
+        .route(
+            "/api/contracts/status/bulk",
+            post(handlers::bulk_update_contract_status),
         )
         .route(
             "/api/contracts/:id/performance",
@@ -237,6 +278,19 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/:id/metrics/catalog",
             get(custom_metrics_handlers::get_metric_catalog),
+        )
+        .route(
+            "/api/contracts/:id/compatibility",
+            get(handlers::compatibility::get_contract_compatibility)
+                .post(handlers::compatibility::add_contract_compatibility),
+        )
+        .route(
+            "/api/contracts/:id/compatibility/export",
+            get(handlers::compatibility::export_contract_compatibility),
+        )
+        .route(
+            "/api/contracts/:id/interoperability",
+            get(interoperability_handlers::get_contract_interoperability),
         )
         .route(
             "/api/contracts/:id/compatibility-matrix",
@@ -279,6 +333,16 @@ pub fn contract_routes() -> Router<AppState> {
             "/api/contracts/simulate-deploy",
             post(simulation_handlers::simulate_deploy),
         )
+        // Gas usage estimation (Issue #496)
+        // Static segment "gas-estimate/batch" registered before dynamic ":method"
+        .route(
+            "/api/contracts/:id/methods/gas-estimate/batch",
+            post(gas_estimation_handlers::batch_gas_estimate),
+        )
+        .route(
+            "/api/contracts/:id/methods/:method/gas-estimate",
+            get(gas_estimation_handlers::get_method_gas_estimate),
+        )
         // Review system endpoints
         .route(
             "/api/contracts/:id/reviews",
@@ -299,6 +363,15 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/:id/rating-stats",
             get(handlers::reviews::get_rating_stats),
+        )
+        // Contract clone endpoints (#487)
+        .route(
+            "/api/contracts/:id/clone",
+            post(clone_federation_handlers::clone_contract),
+        )
+        .route(
+            "/api/contracts/:id/clones",
+            get(clone_federation_handlers::get_contract_clones),
         )
         .merge(favorite_routes())
 }
@@ -345,6 +418,11 @@ pub fn publisher_routes() -> Router<AppState> {
             "/api/publishers/:id/contracts",
             get(handlers::get_publisher_contracts),
         )
+        // Issue #603: publisher verification badge endpoint
+        .route(
+            "/api/publishers/:id/verify",
+            post(publisher_verification_handlers::verify_publisher),
+        )
 }
 
 pub fn contributor_routes() -> Router<AppState> {
@@ -389,12 +467,48 @@ pub fn health_routes() -> Router<AppState> {
             "/api/analytics/summary",
             get(analytics_handlers::get_analytics_summary),
         )
+        .route(
+            "/api/analytics/timeseries",
+            get(analytics_handlers::get_analytics_timeseries),
+        )
+}
+
+pub fn governance_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/governance/proposals",
+            post(governance_handlers::create_proposal).get(governance_handlers::list_proposals),
+        )
+        .route(
+            "/api/governance/proposals/:id",
+            get(governance_handlers::get_proposal),
+        )
+        .route(
+            "/api/governance/proposals/:id/votes",
+            post(governance_handlers::cast_vote).get(governance_handlers::get_vote_tally),
+        )
+        .route(
+            "/api/governance/proposals/:id/execute",
+            post(governance_handlers::execute_proposal),
+        )
+        .route(
+            "/api/governance/contracts/:id/voting-rights",
+            get(governance_handlers::list_voting_rights)
+                .post(governance_handlers::upsert_voting_rights),
+        )
+}
+
+pub fn category_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/categories", get(category_handlers::list_categories))
+        .route("/api/categories/:id", get(category_handlers::get_category))
 }
 
 pub fn network_routes() -> Router<AppState> {
     Router::new()
         .route("/networks", get(handlers::list_networks))
         .route("/api/networks", get(handlers::list_networks))
+        .route("/api/networks/health", get(handlers::get_network_health))
 }
 
 pub fn health_monitor_routes() -> Router<AppState> {
@@ -439,8 +553,15 @@ pub fn compatibility_dashboard_routes() -> Router<AppState> {
     )
 }
 
-pub fn category_routes() -> Router<AppState> {
-    Router::new().route("/api/categories", get(category_handlers::list_categories))
+/// Issue #619 — mutation testing routes.
+pub fn mutation_testing_routes() -> Router<AppState> {
+    Router::new()
+        // Trigger a new mutation test run
+        .route(
+            "/api/contracts/:id/mutations",
+            post(mutation_testing_handlers::run_mutation_tests)
+                .get(mutation_testing_handlers::list_mutation_runs),
+        )
 }
 
 pub fn canary_routes() -> Router<AppState> {
@@ -569,11 +690,265 @@ pub fn admin_routes() -> Router<AppState> {
         .route_layer(middleware::from_fn(auth::require_admin))
 }
 
+pub fn federation_routes() -> Router<AppState> {
+    Router::new()
+        // Federated registry management (#499)
+        .route(
+            "/api/federation/registries",
+            get(clone_federation_handlers::list_federated_registries)
+                .post(clone_federation_handlers::register_federated_registry),
+        )
+        .route(
+            "/api/federation/registries/:id",
+            get(clone_federation_handlers::get_federated_registry),
+        )
+        // Sync operations
+        .route(
+            "/api/federation/sync",
+            post(clone_federation_handlers::sync_from_federated_registry),
+        )
+        .route(
+            "/api/federation/sync/:job_id",
+            get(clone_federation_handlers::get_sync_job_status),
+        )
+        .route(
+            "/api/federation/sync-history",
+            get(clone_federation_handlers::get_federation_sync_history),
+        )
+        // Discovery
+        .route(
+            "/api/federation/discover",
+            get(clone_federation_handlers::discover_federated_registries),
+        )
+        // Configuration
+        .route(
+            "/api/federation/config",
+            get(clone_federation_handlers::get_federation_config),
+        )
+        // Contract federation attribution
+        .route(
+            "/api/contracts/:id/federation",
+            get(clone_federation_handlers::get_contract_federation_attribution)
+                .patch(clone_federation_handlers::update_contract_federation_settings),
+        )
+}
+
 pub fn websocket_routes() -> Router<AppState> {
-    Router::new().route(
-        "/ws/contracts",
-        axum::routing::get(contract_events::contracts_websocket),
-    )
+    // /ws/contracts is registered in contract_routes via contract_events::contracts_websocket.
+    // This function is retained so main.rs can call it without a merge conflict.
+    Router::new()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY SCANNING ROUTES (#498)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn security_scanning_routes() -> Router<AppState> {
+    Router::new()
+        // Security scanner management
+        .route(
+            "/api/security/scanners",
+            get(security_scan_handlers::list_security_scanners)
+                .post(security_scan_handlers::create_security_scanner),
+        )
+        // Contract security endpoints
+        .route(
+            "/api/contracts/:id/scans",
+            get(security_scan_handlers::list_security_scans)
+                .post(security_scan_handlers::trigger_security_scan),
+        )
+        .route(
+            "/api/contracts/:id/scans/:scan_id",
+            get(security_scan_handlers::get_security_scan),
+        )
+        .route(
+            "/api/contracts/:id/security",
+            get(security_scan_handlers::get_contract_security_summary),
+        )
+        .route(
+            "/api/contracts/:id/security/score-history",
+            get(security_scan_handlers::get_security_score_history),
+        )
+        .route(
+            "/api/contracts/:id/issues",
+            get(security_scan_handlers::list_security_issues),
+        )
+        .route(
+            "/api/contracts/:id/issues/:issue_id",
+            patch(security_scan_handlers::update_security_issue),
+        )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUBSCRIPTION & NOTIFICATION ROUTES (#493)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn subscription_routes() -> Router<AppState> {
+    Router::new()
+        // User subscriptions
+        .route(
+            "/api/me/subscriptions",
+            get(subscription_handlers::list_user_subscriptions),
+        )
+        .route(
+            "/api/contracts/:id/subscribe",
+            post(subscription_handlers::subscribe_to_contract)
+                .delete(subscription_handlers::unsubscribe_from_contract),
+        )
+        .route(
+            "/api/subscriptions/:id",
+            patch(subscription_handlers::update_subscription),
+        )
+        // Notification preferences
+        .route(
+            "/api/notifications/preferences",
+            get(subscription_handlers::get_notification_preferences)
+                .patch(subscription_handlers::update_notification_preferences),
+        )
+        // Notifications
+        .route(
+            "/api/notifications",
+            get(subscription_handlers::list_notifications),
+        )
+        .route(
+            "/api/notifications/:id/read",
+            post(subscription_handlers::mark_notification_read),
+        )
+        .route(
+            "/api/notifications/read-all",
+            post(subscription_handlers::mark_all_notifications_read),
+        )
+        .route(
+            "/api/notifications/statistics",
+            get(subscription_handlers::get_notification_statistics),
+        )
+        // Webhooks
+        .route(
+            "/api/webhooks",
+            get(subscription_handlers::list_webhooks).post(subscription_handlers::create_webhook),
+        )
+        .route(
+            "/api/webhooks/:id",
+            delete(subscription_handlers::delete_webhook),
+        )
+        .route(
+            "/api/webhooks/:id/deliveries",
+            get(subscription_handlers::get_webhook_deliveries),
+        )
+        .route(
+            "/api/webhooks/:id/test",
+            post(subscription_handlers::test_webhook),
+        )
+        .route(
+            "/api/webhook-deliveries/:id/retry",
+            post(subscription_handlers::retry_webhook_delivery),
+        )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORMAL VERIFICATION ROUTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT INTERACTION GRAPH ANALYSIS ROUTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn graph_analysis_routes() -> Router<AppState> {
+    Router::new()
+        // Full analysis report: clusters + critical contracts + cycles
+        .route(
+            "/api/contracts/graph/analysis",
+            get(graph_analysis_handlers::get_graph_analysis),
+        )
+        // Sub-network / community list
+        .route(
+            "/api/contracts/graph/clusters",
+            get(graph_analysis_handlers::get_graph_clusters),
+        )
+        // Sub-network detail by cluster ID
+        .route(
+            "/api/contracts/graph/subnetwork/:cluster_id",
+            get(graph_analysis_handlers::get_subnetwork),
+        )
+        // Critical contract ranking
+        .route(
+            "/api/contracts/graph/critical",
+            get(graph_analysis_handlers::get_critical_contracts),
+        )
+        // Vulnerability propagation from a specific contract
+        .route(
+            "/api/contracts/:id/vulnerability-propagation",
+            get(graph_analysis_handlers::get_vulnerability_propagation),
+        )
+}
+
+pub fn formal_verification_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/contracts/:id/formal-verification",
+            post(formal_verification_handlers::trigger_formal_verification)
+                .get(formal_verification_handlers::list_formal_verification_sessions),
+        )
+        .route(
+            "/api/contracts/:id/formal-verification/:session_id",
+            get(formal_verification_handlers::get_formal_verification_session),
+        )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT VERIFICATION STATUS ROUTES (issue #724)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn verification_status_routes() -> Router<AppState> {
+    Router::new()
+        // Submit a contract for verification by ID (complements the global /verify endpoint)
+        .route(
+            "/api/contracts/:id/verify",
+            post(verification_handlers::submit_contract_verification),
+        )
+        // Get current verification status (cached 1 hour)
+        .route(
+            "/api/contracts/:id/verification-status",
+            get(verification_handlers::get_contract_verification_status),
+        )
+        // Get chronological audit trail of verification status changes
+        .route(
+            "/api/contracts/:id/verification-history",
+            get(verification_handlers::get_contract_verification_history),
+        )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ZERO-KNOWLEDGE PROOF VALIDATION ROUTES (#624)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn zk_proof_routes() -> Router<AppState> {
+    Router::new()
+        // ── Circuit management ─────────────────────────────────────────
+        .route(
+            "/api/contracts/:id/zk/circuits",
+            post(zk_proof_handlers::register_circuit)
+                .get(zk_proof_handlers::list_circuits),
+        )
+        .route(
+            "/api/contracts/:id/zk/circuits/:circuit_id",
+            get(zk_proof_handlers::get_circuit),
+        )
+        // ── Proof submission & validation ──────────────────────────────
+        .route(
+            "/api/contracts/:id/zk/proofs",
+            post(zk_proof_handlers::submit_proof)
+                .get(zk_proof_handlers::list_proofs),
+        )
+        .route(
+            "/api/contracts/:id/zk/proofs/:proof_id",
+            get(zk_proof_handlers::get_proof),
+        )
+        // ── Privacy-preserving analytics ───────────────────────────────
+        .route(
+            "/api/contracts/:id/zk/analytics",
+            get(zk_proof_handlers::get_zk_analytics),
+        )
 }
 
 pub fn collaborative_review_routes() -> Router<AppState> {
