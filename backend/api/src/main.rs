@@ -86,6 +86,7 @@ mod search_client;
 mod security_scan_handlers;
 mod subscription_handlers;
 mod type_safety;
+mod usage_counter;
 mod validation;
 mod verification_handlers;
 mod webhook_delivery;

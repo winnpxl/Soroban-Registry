@@ -277,6 +277,10 @@ pub fn contract_routes() -> Router<AppState> {
             get(analytics_handlers::get_contract_analytics),
         )
         .route(
+            "/api/contracts/:id/stats",
+            get(handlers::get_contract_stats),
+        )
+        .route(
             "/api/analytics/dashboard",
             get(analytics_handlers::get_analytics_dashboard),
         )
