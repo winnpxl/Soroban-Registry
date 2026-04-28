@@ -160,9 +160,12 @@ pub fn contract_routes() -> Router<AppState> {
         )
         .route(
             "/api/contracts/trending",
-            get(handlers::get_trending_contracts),
+            get(contract_stats_handlers::get_trending_contracts),
         )
-        .route("/contracts/trending", get(handlers::get_trending_contracts))
+        .route(
+            "/contracts/trending",
+            get(contract_stats_handlers::get_trending_contracts),
+        )
         .route("/api/contracts/batch", post(handlers::get_contracts_batch))
         .route("/contracts/batch", post(handlers::get_contracts_batch))
         .route("/api/contracts/graph", get(handlers::get_contract_graph))
@@ -330,6 +333,14 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/:id/analytics",
             get(analytics_handlers::get_contract_analytics),
+        )
+        .route(
+            "/api/contracts/:id/stats",
+            get(contract_stats_handlers::get_contract_stats),
+        )
+        .route(
+            "/api/contracts/:id/stats/timeseries",
+            get(contract_stats_handlers::get_contract_stats_timeseries),
         )
         .route(
             "/api/analytics/dashboard",
