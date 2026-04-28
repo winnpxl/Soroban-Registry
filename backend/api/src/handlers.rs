@@ -5681,13 +5681,14 @@ pub async fn get_contract_deployments(
     query_builder.push_bind(&target_uuids);
     query_builder.push(") AND ci.interaction_type = cast('deploy' as text)");
 
-    let deployments: Vec<ContractDeployment> = sqlx::query_as(
-        "SELECT * FROM contract_deployments WHERE contract_id = $1 ORDER BY deployed_at DESC",
-    )
-    .bind(contract_uuid)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| db_internal_error("get contract deployments", err))?;
+    if let Some(from) = params.from_date {
+        query_builder.push(" AND ci.created_at >= ");
+        query_builder.push_bind(from);
+    }
+    if let Some(to) = params.to_date {
+        query_builder.push(" AND ci.created_at <= ");
+        query_builder.push_bind(to);
+    }
 
     query_builder.push(" ORDER BY ci.created_at DESC");
     query_builder.push(" LIMIT ");
@@ -6864,4 +6865,5 @@ pub async fn delete_favorite_search(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
 }
