@@ -1,4 +1,6 @@
+pub mod deps;
 // Contract verification engine
+pub mod engine;
 // Compiles source code and compares with on-chain bytecode
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};

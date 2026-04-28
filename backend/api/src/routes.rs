@@ -2,6 +2,7 @@
 use crate::openapi;
 use crate::{
     ab_test_handlers, analytics_handlers, auth, auth_handlers, batch_verify_handlers,
+    client_observability_handlers,
     breaking_changes, canary_handlers, category_handlers, clone_federation_handlers,
     compatibility_testing_handlers, contract_events, contract_stats_handlers,
     custom_metrics_handlers, deprecation_handlers, error_logging, formal_verification_handlers,
@@ -104,6 +105,7 @@ fn release_notes_routes() -> Router<AppState> {
 pub fn observability_routes() -> Router<AppState> {
     Router::new()
         .route("/metrics", get(metrics_handler::metrics_endpoint))
+    .route("/api/observability/client_breaker", post(client_observability_handlers::report_client_breaker))
         .route("/api/errors/report", post(error_logging::report_error))
         .route("/api/errors/dashboard", get(error_logging::error_dashboard))
 }
@@ -193,7 +195,19 @@ pub fn contract_routes() -> Router<AppState> {
             "/api/contracts/:id/audit-log",
             get(handlers::get_contract_audit_log),
         )
-        .route("/api/contracts/:id/abi", get(handlers::get_contract_abi))
+        .route(
+            "/api/contracts/:id/abi",
+            get(handlers::get_contract_abi)
+                .post(abi_versioning_handlers::publish_abi),
+        )
+        .route(
+            "/api/contracts/:id/abi/:version",
+            get(abi_versioning_handlers::get_abi_version),
+        )
+        .route(
+            "/api/contracts/:id/check-compatibility",
+            post(abi_versioning_handlers::check_compatibility),
+        )
         .route(
             "/api/contracts/:id/openapi.yaml",
             get(handlers::get_contract_openapi_yaml),
